@@ -1,0 +1,1388 @@
+CachyOS install; patches & customizations applied
+mz-popbook / MacBookAir6,1 (Crucial P2 2TB NVMe)
+Installed 2026-09-11. Verified against live system state at time of writing.
+
+=====================================================================
+CONFIRMED APPLIED AND WORKING (verified live, not just intended)
+=====================================================================
+
+1. BOOTLOADER: Limine
+   - Registered via efibootmgr as Boot0000, first in BootOrder.
+   - Old macOS boot entries (Boot0080 etc., pointing at the original
+     \System\Library\CoreServices\boot.efi on the now-mostly-gone old
+     partition 2) are still sitting in NVRAM as harmless unused fallbacks.
+     Safe to remove later with `efibootmgr -b 0080 -B` if you want to tidy up.
+
+2. /boot MOUNTED DIRECTLY ON THE EFI SYSTEM PARTITION (not a btrfs directory)
+   - Required because Limine has NO native BTRFS support; it only reads
+     FAT12/16/32 and ISO9660 (confirmed against Arch Wiki / Limine docs,
+     correcting an earlier wrong assumption mid-install that it could read
+     btrfs directly).
+   - Kernel + initramfs physically live on the FAT32 ESP as a result.
+
+3. PARTITION LAYOUT (nvme0n1, 2TB Crucial P2)
+   p1  4.3GB  FAT32, GPT type EF00 (EFI System Partition)
+       -> "CachyOS Installer" rescue/reinstall medium. Contains the
+          extracted CachyOS ISO content (not just the raw .iso file; archiso needs /EFI, /arch, /boot extracted, including the
+          archisosearchuuid marker file, to boot via its grub.cfg).
+       -> Had to be GPT-typed EF00 specifically (not just FAT32-formatted)
+          for Apple's native Option-key boot picker to recognize/boot it; a Mac-firmware-specific requirement, doesn't apply on generic PCs.
+       -> Kept permanently as a rescue/reinstall option, same role the old
+          Pop!_OS recovery partition served.
+   p2  119.2GB APFS: STILL PRESENT, NOT RECLAIMED. Leftover unused macOS
+       partition from the original factory install. A reclaim was planned
+       and even executed manually mid-install, but Calamares recreated the
+       partition table through its own flow afterward and left this one
+       alone. Free ~119GB sitting unused if you want it back later.
+   p3  4GB FAT32, EFI System Partition; built by Calamares itself, sized
+       larger than the 2GB CachyOS-documented minimum (an earlier
+       manually-built 2GB ESP was also wiped and replaced by whatever
+       Calamares did internally).
+   p4  ~1.2TB+  BTRFS: the main OS volume. Absorbed the old Pop!_OS swap
+       partition's space too (no separate swap partition anymore).
+   p6  495.7GB ext4 "Backups"; UNTOUCHED throughout the entire migration.
+       This file lives here.
+
+4. BTRFS SUBVOLUMES (Calamares's own default scheme)
+   @, @home, @root, @srv, @cache, @log, @tmp
+   NOTE: A custom scheme (@snapshots, @swap, @libvirt, matching what this
+   machine actually needs; see "outstanding" below) was designed and even
+   manually created mid-install, but Calamares wiped and recreated the
+   partition/subvolumes through its own flow before that could be used.
+   What's actually running is CachyOS's stock Calamares layout.
+
+5. SWAP: zram + BTRFS swapfile (updated, see item 16)
+   /dev/zram0, 7.7GB, zstd-compressed, CachyOS default, priority 100
+   (preferred for normal use) PLUS a 9GB BTRFS swapfile at
+   /swap/swapfile, priority -1 (fallback/hibernate target only), added
+   later in this same install for hibernate support; see item 13 for
+   why, and item 16 for a subvolume-placement fix that swapfile needed.
+
+6. FN-KEY / KEYBOARD REMAP (ported from the old Pop!_OS setup)
+   Values: swap_opt_cmd=1, fnmode=2 (F1-F12 default, hold Fn for media
+   keys), swap_fn_leftctrl=1 (swaps physical Fn <-> Left Ctrl).
+   - NOT delivered via /etc/modprobe.d/hid_apple.conf (tried first,
+     deleted after it proved unreliable); the internal keyboard's
+     hid_apple driver binds right at the initrd-to-real-root switch_root
+     boundary, before /etc/modprobe.d is reliably read yet. Confirmed via
+     journalctl timestamps showing the keyboard's USB HID bind event
+     essentially simultaneous with initrd-switch-root.service completing.
+     This is a genuine boot-ordering race, not a config mistake.
+   - ACTUAL fix: /etc/udev/rules.d/99-hid-apple-fix.rules
+       ACTION=="add", SUBSYSTEM=="module", KERNEL=="hid_apple", RUN+="/bin/sh -c 'echo 1 > /sys/module/hid_apple/parameters/swap_opt_cmd; echo 2 > /sys/module/hid_apple/parameters/fnmode; echo 1 > /sys/module/hid_apple/parameters/swap_fn_leftctrl'"
+     Fires the instant the module loads, whenever that happens in boot; sidesteps the race entirely. Confirmed working after a genuine full
+     reboot (not a soft-reboot).
+
+7. PAM FAILLOCK LOCKOUT DISABLED
+   /etc/security/faillock.conf has `deny = 0` (default was lock-out after
+   3 failed password attempts / 10 minute lockout; affected GDM
+   login/unlock screen and sudo, not actually a GNOME-specific setting).
+
+8. GNOME EXTENSIONS + SETTINGS PORTED FROM THE HOST DESKTOP (not the old
+   Pop!_OS box; the "host PC" this session also runs on, a separate
+   CachyOS desktop machine with matching GNOME Shell 50.4)
+   Copied the 9 actively-enabled extensions (files + per-extension
+   settings) from ~/.local/share/gnome-shell/extensions/ on the host:
+     appindicatorsupport, dash-to-dock, Vitals, clipboard-indicator,
+     audio-switch-shortcuts, primary_input_on_lockscreen, ddterm,
+     medialine, CoverflowAltTab
+   Deliberately excluded host-hardware-specific values:
+     - audio-switch-shortcuts' "audio-devices" list (host's own sound
+       card IDs/names, meaningless on the laptop)
+     - dash-to-dock's "preferred-monitor-by-connector"='DP-2' (host's
+       external monitor, laptop has no such connector)
+   Also copied:
+     - Input sources: xkb 'us' + 'ru', per-window=true
+     - Switch-language hotkeys: <Alt>Shift_L (forward), <Shift><Alt> (back)
+     - Extension Manager (com.mattjakeman.ExtensionManager) via Flatpak,
+       user scope (system-scope install failed; Flatpak system Deploy
+       needs interactive polkit auth, not available over non-interactive
+       SSH; had to `flatpak remote-add --user flathub ...` since the
+       flathub remote was only registered at system scope, then install
+       --user)
+   NOTE: takes effect on next GNOME session start (log out/in; a live
+   Alt+F2 'r' restart only works on X11, not Wayland).
+
+9. FACETIME HD CAMERA: working, installed via AUR (facetimehd-dkms +
+   facetimehd-firmware), NOT the old fragile manual git-clone-and-make
+   build from the Pop!_OS box. DKMS-packaged so it survives kernel
+   updates automatically, unlike the old approach which needed a full
+   manual rebuild after every kernel change (and had silently stopped
+   working on the old box as a result).
+
+10. FACETIME HD CAMERA: DKMS BUILD FIX (kernel 7.2 strncpy removal)
+    The AUR facetimehd-dkms package (0.7.0.2) failed to build against the
+    running 7.2.4-3-cachyos kernel with:
+        fthd_v4l2.c:399: error: call to undeclared library function 'strncpy'
+    Root cause (verified via web search, not guessed): Linux kernel 7.2
+    completely removed strncpy() from the kernel after a six-year, 360+
+    patch cleanup effort (landed June 2026); the function no longer
+    exists in-kernel at all, not just missing a header include (adding
+    #include <linux/string.h> alone did NOT fix it, confirming this).
+    Fix applied directly to the DKMS-registered source (persists across
+    rebuilds, unlike patching the /var/lib/dkms build/ scratch copy):
+        /usr/src/facetimehd-0.7.0.2/fthd_v4l2.c line 400:
+        strncpy(...) -> strscpy(...)   (kernel's own recommended replacement,
+                                          same 3-argument signature, drop-in)
+    Then: sudo dkms install facetimehd/0.7.0.2 -k 7.2.4-3-cachyos
+    Verified working: /dev/video0 present, facetimehd-data calibration
+    files (1771/1871/1874_01XX.dat, 9112_01XX.dat; same filenames as the
+    old Pop!_OS backup) loaded correctly, clean ISP init in kernel log
+    (firmware loaded 1392kb, DDR calibration completed, no errors).
+    NOTE: this exact same strncpy fix will likely be needed again on any
+    OTHER out-of-tree/AUR kernel module that hasn't been updated for
+    kernel 7.2+ yet (broadcom-wl already built fine, so it doesn't hit
+    this specific issue).
+
+11. THUNDERBOLT DISABLED FOR POWER SAVINGS: acpi_osi=!Darwin
+    Added to /etc/default/limine's KERNEL_CMDLINE, then regenerated boot
+    entries for both installed kernels via `limine-update`. This tells
+    the firmware the OS isn't macOS-compatible, which fully disables the
+    Intel DSL3510 "Cactus Ridge" Thunderbolt controller (ArchWiki-
+    documented ~2W power savings on a MacBook Air 2013, vs. only partial
+    savings, and still 0.9W overhead; from the milder blacklist+
+    runtime-PM-only approach). Deliberate tradeoff: Thunderbolt no longer
+    works at all (confirmed gone from `lspci` entirely after reboot, not
+    just unbound). Verified after reboot that nothing else broke: fn-key
+    remap intact (fnmode=2, swap_opt_cmd=1, swap_fn_leftctrl=1),
+    applesmc fan sensor working, backlight readable, camera still
+    functional. mbpfan-git and rtkit were also installed via pacman in
+    this same session (packages only; mbpfan.conf/service setup from
+    earlier in this file still needs to be done).
+
+12. NATIVE APPLE OPTION-KEY BOOT PICKER: CHANGED DEFAULT TO LINUX
+    The "hold Option at power-on" picker was defaulting to the old macOS
+    entry. Fixed WITHOUT touching NVRAM by hand (Apple's efi-boot-device
+    format is proprietary/binary-plist and risky to hand-edit, and `bless`
+    is macOS-only so unavailable here): at the picker, arrow over to the
+    Linux/EFI Boot icon and hold Control (an up-arrow indicator appears
+    under the icon); this uses Apple's own native firmware mechanism to
+    set that entry as the new default. Confirmed working. Separate from
+    efibootmgr's BootOrder (which was already Limine-first at the NVRAM
+    Boot#### level the whole time); this is Apple's own additional
+    picker-specific default, a different mechanism.
+
+13. HIBERNATE: ATTEMPTED, CURRENTLY BROKEN (spurious S4 self-wake)
+    Setup completed correctly:
+      - 9GB BTRFS swapfile at /swap/swapfile (`btrfs filesystem mkswapfile
+        --size 9g`, handles NoCOW/no-compress automatically), added to
+        /etc/fstab, active as swap (priority -1, below zram's 100 so zram
+        stays primary for normal use).
+      - resume=UUID=0109f7a0-932f-4ff8-83bf-19e92986e43a
+        resume_offset=3710479 (from `btrfs inspect-internal map-swapfile
+        -r`) added to /etc/default/limine KERNEL_CMDLINE.
+        [SUPERSEDED: see item 16: the swapfile was later moved to its
+        own subvolume and the offset is now 6104320, not 3710479.]
+      - Added the `resume` hook (NOT `sd-resume`; that name doesn't
+        exist, an initial wrong guess of mine; the plain `resume` hook
+        from the base mkinitcpio package works fine even alongside
+        systemd-based hooks) to /etc/mkinitcpio.conf HOOKS, placed
+        before `filesystems`. Rebuilt both kernels' initramfs via
+        `limine-update`.
+      - Verified after reboot: /sys/power/resume correctly shows "259:4"
+        (the real partition), /sys/power/resume_offset shows 3710479; config is 100% correctly wired up.
+    Actual `systemctl hibernate` result: kernel begins entering ACPI S4,
+    then immediately self-wakes within the same second, before ever
+    reaching the actual disk-write phase (confirmed via kernel log:
+    "Preparing to enter system sleep state S4" -> "Restoring platform
+    NVS memory" -> "Waking up from system sleep state S4" -> "hibernation
+    exit", all in the same 1-second timestamp). Swapfile confirmed still
+    0 bytes used afterward; no data was ever written, so this failure
+    mode is safe (no corruption risk), just non-functional. No new boot
+    ID was created (confirmed via `journalctl --list-boots`); the
+    machine never actually powered off; the ~2min black screen during
+    the freeze/snapshot-prep phase followed by GDM reappearing after the
+    abort is what looked like a "cold boot" from the outside.
+    TESTED HYPOTHESIS (ruled out): noticed acpi_osi=!Darwin was
+    downgrading LID0/ADP1/EC from S4-capable to S3-only in
+    /proc/acpi/wakeup (visible side effect of telling the firmware
+    "not macOS"; it likely exposes different/less-tested ACPI tables
+    for the non-Darwin code path). Reverted acpi_osi=!Darwin, rebooted,
+    confirmed S4 capability restored on those devices, retried hibernate; EXACT SAME instant S4-bounce failure still happened. This rules out
+    acpi_osi=!Darwin as the cause. Re-added it afterward (Thunderbolt
+    power savings, §12) since removing it bought nothing for hibernate.
+    ROOT CAUSE STILL UNKNOWN. Both hibernate attempts produced the
+    identical signature regardless of that setting: "Preparing to enter
+    system sleep state S4" -> CPUs offline -> "Restoring platform NVS
+    memory" -> "Waking up from system sleep state S4", all within the
+    same 1-second timestamp, no gap in journald boot continuity either
+    time (confirmed via journalctl --list-boots; a genuine hibernate
+    resume wouldn't create a new boot ID anyway, since a successful
+    image restore overwrites the fresh boot's own boot_id with the
+    saved one, so absence of a new boot ID isn't itself proof of
+    failure; the same-second CPU offline/online bounce with zero
+    elapsed time is the actual proof).
+    CORRECTED VERDICT (superseded the above; see below): the log-based
+    analysis above was misleading. Ran a definitive test instead: a
+    detached background logger (`setsid bash -c 'while true; do date
+    +%s.%N >> file; sleep 1; done'`, immune to any session-restore or
+    kernel-clock-adjustment ambiguity) written to /tmp/hibernate_test.log
+    every second, then hibernated, left off for ~6 minutes, woken up.
+    RESULT: a genuine 357-second gap in the timestamps (16:22:07 ->
+    16:28:05), then the loop resumed exactly where it left off. This is
+    airtight, unfakeable proof that hibernate DOES work on this hardware
+    -- the process was genuinely frozen and the system genuinely lost
+    power for that real duration.
+    However, MULTIPLE OTHER attempts (same session, same config) showed
+    the completely different instant-self-wake-within-the-same-second
+    failure signature documented above, including one where USB
+    controllers logged "root hub lost power or was reset" and the
+    camera fully re-enumerated (peripheral power cycling) while the
+    core CPU/RAM/clock state never actually stopped (proven via
+    unchanged uptime -s, continuous PID elapsed time, same boot ID,
+    swapfile still 0 bytes used for THAT attempt).
+    ACTUAL CONCLUSION: hibernate is INTERMITTENT on this hardware, not
+    consistently broken and not consistently reliable -- capable of
+    working correctly (proven), but capable of silently aborting
+    instead on other attempts (also proven, multiple times). No known
+    trigger identified yet for which outcome occurs on a given attempt.
+    DECISION: left configured and available for use, with the explicit
+    caveat that it may occasionally fail to actually power down (in
+    which case the machine just keeps running instead of losing data --
+    the failure mode itself is safe, just unpredictable). Do not rely
+    on it for unattended/long-duration battery savings without
+    confirming success after the fact (e.g. checking uptime/journal)
+    until/unless the intermittent root cause gets identified.
+
+15a. GNOME POWER MENU HIBERNATE OPTION: installed the "Hibernate Power
+    Menu" GNOME Shell extension (uuid hibernate-power-menu@arnakazim,
+    officially supports shell-version 50, matches this system's GNOME
+    Shell 50.4 -- checked compatibility deliberately, since the other/
+    older "Hibernate Status Button" extension only supports up to shell
+    48 and would have been a real compatibility risk). Installed from
+    source (git.sr.ht/~arnakazim/gnome-hibernate-power-menu, `make
+    install`), enabled via dconf enabled-extensions (gnome-extensions
+    CLI couldn't see it yet since gnome-shell hadn't rescanned --
+    dconf write persists regardless of live shell state). Requires an
+    Alt+F2 r shell restart (X11) or logout/login to actually load.
+    Adds Hibernate + Hybrid Sleep to the system power menu, with smart
+    greying-out if hibernation isn't detected as available. NOT YET
+    CONFIRMED whether a polkit rule is additionally needed for a normal
+    (non-sudo) desktop session to actually trigger hibernate via this
+    menu -- polkit's own defaults usually already allow this for any
+    locally-active session, so didn't add one preemptively; add
+    /etc/polkit-1/rules.d/ JS rule for org.freedesktop.login1.hibernate
+    only if actually observed to be blocked.
+
+14. SUSPEND-THEN-HIBERNATE -- TRIED, ROOT-CAUSED, REVERTED TO PLAIN SUSPEND
+    Originally enabled as HandleLidSwitch=suspend-then-hibernate with
+    HibernateDelaySec=1h (see old text below for what was tried). This
+    was LATER FULLY DIAGNOSED (2026-09-12 session, after items 14/17)
+    and found to have a real, structural design mismatch with this
+    hardware -- not just "intermittent," a genuine root cause:
+
+    suspend-then-hibernate is designed to arm an RTC wakealarm and
+    silently transition from S3 suspend into a real hibernate-and-
+    poweroff WHILE THE LID STAYS CLOSED, invisible to the user -- the
+    disruptive part (real poweroff, later requiring a full cold boot to
+    resume) is supposed to already be done and over with by the time you
+    open the lid.
+    ROOT CAUSE: `/proc/acpi/wakeup` on this machine has NO RTC entry at
+    all (confirmed: LID0 is present and *enabled* as an S3 wake source,
+    EC is present but disabled, but RTC doesn't appear in the table at
+    all). The RTC hardware itself CAN be armed (tested directly: writing
+    a future epoch time to /sys/class/rtc/rtc0/wakealarm succeeds and
+    reads back correctly) -- but arming it is meaningless if the
+    platform's ACPI tables never wired the RTC up as a valid wake-
+    interrupt source. Confirmed empirically: during a real test with
+    HibernateDelaySec=30s, the machine sat in plain S3 for ~4.5 minutes
+    with ZERO wake-related kernel activity, only reacting the instant
+    the lid was physically opened.
+    CONSEQUENCE: since the RTC-triggered silent transition can never
+    happen on this hardware, the ONLY thing that can ever wake the
+    machine from the S3 phase is a real external wake source -- the lid
+    switch. So opening the lid (intending to just resume and use the
+    machine) is what ends up triggering the disruptive hibernate-and-
+    poweroff instead, backwards from the intended design: a brief silent
+    S3 wake-to-check-the-timer (fan spins briefly, screen stays off --
+    this part is correct/by-design), immediately followed by the real
+    hibernate write and a genuine, full poweroff (still silent, screen
+    already off). The user then has to notice the machine is dead, press
+    and hold power (a real off-state needs a deliberate press, unlike
+    waking from suspend), see the Limine bootloader (proof it was a true
+    cold boot, not a suspend-resume -- suspend-resume shows no bootloader
+    at all since the CPU/RAM never lost power), and wait through a full
+    boot during which the kernel finds the valid image mid-boot and
+    resumes the old session instead of continuing fresh.
+    Separately confirmed NOT the cause, ruled out with real evidence
+    during the same investigation:
+      - Wrong/stale resume_offset: re-checked live, matched exactly.
+      - Missing NoCOW on the swapfile: confirmed set (lsattr showed +C).
+      - HibernateMode=platform vs shutdown: tested both, both succeeded
+        when actually invoked -- not the differentiator.
+      - Disk/device not ready in time: the failed resume attempt's own
+        log showed the device was already resolved and read successfully
+        before failing on "Image not found" -- not a timing/readiness
+        issue at the block-device level.
+      - A real, separate, verified-via-actual-kernel-source finding along
+        the way (kept for reference, NOT applied as a fix -- see below):
+        kernel/power/swap.c writes the hibernation image with REQ_SYNC
+        (an I/O scheduling hint) but never REQ_FUA and never calls
+        blkdev_issue_flush() -- meaning on a drive with Volatile Write
+        Cache enabled (confirmed via `nvme get-feature -f 0x06`: enabled
+        on this exact drive), a write can be acknowledged before it's
+        actually durable on NAND. This is a real, kernel-source-verified
+        gap, but was NOT the explanation for the specific failure
+        actually diagnosed (that one traced cleanly to the RTC/lid issue
+        above), and fixing it would require either disabling the drive's
+        write cache system-wide (real, permanent write-performance cost
+        for all disk I/O, not just hibernate -- deliberately rejected)
+        or patching and maintaining a custom kernel (deliberately
+        rejected as disproportionate to a safe, low-frequency issue).
+
+    FIX APPLIED: /etc/systemd/logind.conf changed back to
+    HandleLidSwitch=suspend. Lid-open now always does a normal, instant
+    S3 resume -- no hidden auto-hibernate, no surprise poweroff, no
+    power-button-required wake for normal use. HibernateDelaySec left at
+    1h in sleep.conf (harmless leftover, has no effect without
+    suspend-then-hibernate active). Manual hibernate
+    (`systemctl hibernate`) still works and was proven reliable (3/3
+    real attempts succeeded when actually traced with full PM debug
+    logging) -- use it directly when you specifically want the battery
+    savings, rather than relying on the automatic lid-triggered version.
+
+    GOTCHA HIT DURING THIS DIAGNOSIS: restarting systemd-logind
+    (`systemctl restart systemd-logind`) while a graphical session is
+    active is NOT safe -- it broke GNOME's session tracking ("Leader of
+    session 'N' is gone while deserializing" in the logind log) and left
+    a frozen/unresponsive GDM login prompt (spinner stopped, no cursor)
+    behind a still-alive-but-orphaned gnome-shell process. Fixed with
+    `systemctl restart gdm.service` (forces a completely fresh greeter +
+    session from scratch). Avoid restarting logind live in the future;
+    if a logind.conf change needs picking up, prefer `systemctl reload`
+    if supported, or accept it'll apply next login/boot.
+
+    ORIGINAL TEXT (context for what was tried before the above):
+    Originally enabled as HandleLidSwitch=suspend-then-hibernate with
+    HibernateDelaySec=1h (systemd-logind restarted to apply). Closing the
+    lid suspended immediately; if it stayed suspended for over an hour,
+    systemd was supposed to automatically trigger the same hibernate path
+    tested in item 13. At the time this was written, the failure mode was
+    just characterized as "intermittent, safe" -- see above for the full,
+    later root-cause diagnosis.
+
+15. TLP INSTALLED AND CONFIGURED (ported from old Pop!_OS values, same
+    i7-4650U CPU): CPU_SCALING_GOVERNOR_ON_AC=schedutil/BAT=conservative,
+    freq caps 800MHz-3.3GHz(AC)/800MHz-1.2GHz(BAT), Intel iGPU freq caps
+    200-1100MHz(AC)/200MHz flat(BAT), USB_BLACKLIST_PHONE=1. Appended to
+    /etc/tlp.conf (not overwritten -- default template preserved above).
+    GOTCHA HIT AND FIXED: tlp.service kept getting killed (signal TERM)
+    on start even after `systemctl disable --now power-profiles-daemon`
+    -- because power-profiles-daemon is D-Bus-activatable, so GNOME's
+    own power UI querying it via D-Bus silently re-activates it
+    regardless of the disabled/stopped state (disable only blocks
+    boot-time autostart, not on-demand D-Bus activation). Fix: `systemctl
+    mask --now power-profiles-daemon.service` instead of disable --
+    masking blocks activation through every path, not just boot.
+    After that, tlp.service starts cleanly (active/exited, exit 0).
+    Verified applied: scaling_governor=conservative, max_freq=1200000
+    (matches the BAT profile -- consistent with this machine's known
+    battery-detection situation).
+
+    Searched for community TLP settings for this same CPU (MacBook Air
+    6.2 forum thread, same i7-4650U) and deliberately added only ONE
+    thing from it: SOUND_POWER_SAVE_ON_AC=0 / ON_BAT=1 / CONTROLLER=Y
+    (Intel HDA codec power-save, low risk -- worst case an occasional
+    audible pop). Everything else from that thread was deliberately
+    SKIPPED after checking against this machine's actual hardware:
+      - DISK_APM_LEVEL_* and SATA_LINKPWR_* are ATA/SATA-only settings;
+        this machine is pure NVMe (Crucial P2), has zero SATA/ATA
+        devices, so these would be pure no-ops despite looking thorough.
+      - PCIE_ASPM_* and RUNTIME_PM_ON_BAT=auto do genuinely apply (NVMe/
+        WiFi/camera are all PCIe devices) but aggressive PCIe ASPM/
+        runtime-PM is a well-known way to destabilize marginal hardware
+        -- specifically risking the WiFi (broadcom-sta) and camera
+        (facetimehd) drivers that took significant effort to get stable
+        this session. Not worth the modest power savings.
+      - Also did NOT copy a WIFI_PWR_ON_AC=1/ON_BAT=5 line from that
+        thread's search summary -- TLP's actual documented parameter
+        takes on/off, not numeric values (confirmed against the real
+        tlp.conf template on this machine), so that specific detail
+        looked like a summarization/version-drift error, not verified
+        before use.
+
+16. SWAP MOVED TO ITS OWN @swap SUBVOLUME (fixes silent snapshot failures)
+    SYMPTOM: every pacman transaction printed a confusing error on the
+    NEXT transaction after this one; "Invalid snapshot '--type'."; from the snap-pac post-transaction hook.
+    ROOT CAUSE (traced via dmesg + reading the actual snap-pac source,
+    not guessed): the hibernate swapfile (item 13) lived inside the `@`
+    root subvolume, and BTRFS unconditionally refuses to snapshot any
+    subvolume containing an active swapfile; confirmed via:
+        dmesg: "BTRFS warning (device nvme0n1p4): cannot snapshot
+                subvolume with active swapfile"
+    This made every `snapper create` call from snap-pac's pacman hooks
+    fail silently (its error went to stderr, which snap-pac's
+    `os.popen()` call never captures; only stdout). snap-pac then
+    cached that failure's empty stdout as the "pre-snapshot number" in
+    /tmp/snap-pac-pre_root, and spliced it into the *next* transaction's
+    snapper command line, which shifted the `--type` flag into the wrong
+    argument position; producing the "Invalid snapshot '--type'." error
+    one transaction removed from the actual cause. This is why it looked
+    unrelated to swap at first.
+    FIX: moved the swapfile out of `@` into its own top-level `@swap`
+    subvolume, matching this system's existing @home/@cache/@log/@tmp
+    convention, so it's structurally outside anything snapper snapshots:
+        sudo swapoff /swap/swapfile
+        sudo mount -o subvolid=5 UUID=0109f7a0-... /mnt/btrfs-top
+        sudo btrfs subvolume create /mnt/btrfs-top/@swap
+        sudo umount /mnt/btrfs-top
+        # added to /etc/fstab:
+        UUID=0109f7a0-... /swap btrfs subvol=/@swap,defaults,noatime 0 0
+        sudo mount /swap
+        sudo btrfs filesystem mkswapfile --size 9g /swap/swapfile
+        sudo btrfs inspect-internal map-swapfile -r /swap/swapfile
+          -> new resume_offset: 6104320 (was 3710479; the old value in
+             item 13 is now stale, physical extents moved to a new file)
+        Updated resume_offset=6104320 in /etc/default/limine
+        KERNEL_CMDLINE, ran `limine-update` to regenerate boot config +
+        both kernels' initramfs.
+    Then reclaimed the old orphaned 9GB swapfile left behind inside `@`
+    (swapoff, umount /swap, rm the exposed old file, remount /swap,
+    swapon again).
+    VERIFIED: ran a real `pacman -S tree` transaction afterward; clean
+    pre/post snapshots (IDs 53/54) with no dmesg warning and no
+    "Invalid snapshot" error. `swapon --show` confirms 9GB file (prio
+    -1) + 7.7GB zram (prio 100), same as before the fix, just correctly
+    placed on disk now.
+    NOTE: this also means hibernate (item 13) has NOT been re-tested
+    since this change; the resume_offset was updated correctly and
+    /sys/power/resume_offset should reflect it after the next reboot,
+    but the actual hibernate-cycle test from item 13 (background logger
+    across a real suspend/wake) has not been rerun against the new
+    swapfile location/offset yet.
+
+17. NO_BATT_FIX (BD_PROCHOT disable); ported from the old Pop!_OS box
+    Applied preemptively as a safety net even though this MacBook's
+    battery IS currently present/detected/charging normally; the fix
+    is unconditional/harmless with a working battery (just means that
+    particular hardware throttle safety net never engages), and having
+    it in place means if the battery ever fails/gets pulled later, the
+    machine won't silently lock at ~800MHz.
+    - /usr/local/bin/no_batt_fix.sh (root, no `sudo` needed; runs via
+      systemd as root already, unlike the old box's user-cron version):
+          r=$(rdmsr 0x1FC); f=$(( (0x$r) & 0xFFFFE )); wrmsr 0x1FC $f
+      Clears bit 0 of MSR_POWER_CTL (0x1FC) = BD_PROCHOT_ENABLE.
+      CORRECTED A DOCUMENTATION ERROR from the old audit while porting:
+      the audit's own prose called this "bit 1 (BD_PROCHOT_ENABLE)" but
+      the mask 0xFFFFE mathematically only clears bit 0; verified via
+      web search against the actual documented MSR_POWER_CTL bit
+      semantics (bit 0 = BD_PROCHOT enable/disable) before trusting it.
+      The script's CODE was correct as inherited; only the audit's own
+      English description of which bit it hit was off by one.
+    - /etc/modules-load.d/msr.conf: `msr` (ensures the msr module,
+      needed for rdmsr/wrmsr, is loaded at boot; msr-tools package
+      was already installed this session for the C-state investigation).
+    - /etc/systemd/system/no_batt_fix.service: Type=simple, oneshot-style
+      (runs once and exits), After=network.target,
+      WantedBy=multi-user.target, enabled.
+    VERIFIED empirically, not just "should work": read MSR 0x1FC before
+    (0x4005d) and after running the service (0x4005c); confirms only
+    bit 0 flipped 1->0, no other bits touched. Service exited 0/SUCCESS.
+    CAVEAT (not yet addressed): this only fires once at boot, same as
+    the old box. The old box masked hibernate/suspend entirely (likely
+    because of ITS flaky/removed battery), so a boot-only fix was
+    sufficient there. THIS box actively uses suspend/hibernate (items
+    14/15), and BD_PROCHOT can reassert after a resume-from-sleep, not
+    just a cold boot -- a resume hook (systemd-sleep drop-in or
+    WantedBy=suspend.target/sleep.target) would be needed for full
+    coverage if the battery is ever actually removed on this unit.
+    Flagged to the user, not yet added -- ask before adding since it
+    goes beyond the literal 1:1 port from the old box.
+
+18. SLOW/UNRELIABLE WAKE FROM SUSPEND: PARTIALLY FIXED, ROOT CAUSE OF THE
+    REMAINING SYMPTOM STILL OPEN
+    Symptom: user reported wake was much faster on the old Pop!_OS box.
+    On this install, opening the lid sometimes shows a brief "fan bump"
+    (a real, legitimate S3 wake) followed by a black screen for anywhere
+    from ~4 to 40+ seconds, after which either (a) the desktop appears
+    on its own, or (b) nothing happens and a power-button press is
+    needed, after which the screen comes on IMMEDIATELY (not with any
+    further delay) -- this specific detail (instant display-on after
+    power press, regardless of how long was waited beforehand) is the
+    key clue: it means the SYSTEM resumes fine and quickly, but the
+    lid-open wake path specifically does not reliably result in the
+    display actually being (re-)driven -- something else has to kick it.
+
+    INVESTIGATED AND FIXED (real, kept):
+    - `/proc/acpi/wakeup` showed SPIT (Apple SPI controller -- feeds the
+      internal keyboard/trackpad) as S3 *disabled*. This is a real,
+      concrete, verified fact: the keyboard/trackpad CANNOT generate a
+      wake interrupt from real S3 suspend on this hardware -- confirmed
+      when keyboard/trackpad input failed to wake a genuinely-stuck
+      machine while the power button (a fixed ACPI hardware feature,
+      always enabled regardless of this table) did. Enabled SPIT live
+      (`echo SPIT > /proc/acpi/wakeup`) and made it persistent via a new
+      oneshot unit, since ACPI wakeup states reset to firmware defaults
+      every boot:
+        /etc/systemd/system/enable-spit-wake.service (enabled)
+        ExecStart checks if SPIT is disabled and toggles it if so.
+      This gives keyboard/trackpad as an additional, gentler way to
+      recover a stuck-asleep machine instead of only the power button.
+      Does NOT by itself fix the root "screen doesn't turn on" issue --
+      it's a recovery-path improvement, verified working.
+    - `NetworkManager-wait-online.service` disabled (was taking 4.174s
+      in `systemd-analyze blame`, blocking `network-online.target`).
+      Legitimate minor boot-time win on its own, kept -- but DISPROVEN
+      as the cause of the GDM/Plymouth delay: disabled it, rebooted,
+      `plymouth-quit-wait.service` was STILL 7.223s (statistically
+      identical to the 7.239s before), and the same ~4-second cluster of
+      wifi-associating + Plymouth-quit-signal + gdm-greeter-session
+      events still happened together at the same point in boot, just
+      with the explicit wait-online dependency no longer in the chain.
+      This was a real, verified-wrong hypothesis -- documented so it
+      isn't re-tried.
+
+    TESTED AND REVERTED (made things worse, do not retry):
+    - Removed acpi_osi=!Darwin to test whether it was slowing resume.
+      Result: resume got WORSE (9s baseline -> 17s), most likely because
+      it also re-enables Thunderbolt (7 PCI bridge devices reappear in
+      lspci), and while the kernel's own apple_poweroff_thunderbolt quirk
+      cuts Thunderbolt's power cleanly on suspend ENTRY (confirmed via
+      dmesg, took only 297ms), something about those bridges coming back
+      adds real time somewhere in the resume path. Reverted immediately;
+      acpi_osi=!Darwin is back (Thunderbolt disabled again, ~9s baseline
+      restored). Do not remove this again for wake-speed reasons.
+
+    STILL UNEXPLAINED / OPEN:
+    - A remarkably consistent ~4-4.7 second delay shows up in EVERY
+      context tested tonight -- cold boot, suspend resume with wifi on,
+      suspend resume with wifi off, console-mode (no GNOME at all) --
+      immune to every systemd-level change tried (disabling
+      wait-online, console vs graphical). Current best-supported theory:
+      this specific WiFi chip/driver (`wl`, proprietary Broadcom,
+      confirmed via `readlink /sys/class/net/wlan0/device/driver`) has
+      an inherent multi-second firmware-load/PHY-init time on every
+      power-up, and GDM/Mutter's own greeter startup independently takes
+      a similar amount of time for unrelated reasons -- the two are
+      NOT causally linked (proven by the NetworkManager-wait-online
+      test above), they just keep landing in the same few-second window
+      by coincidence of similar duration. Not fixed. Actually chasing
+      this further would mean investigating the `wl` driver's own
+      firmware-load timing specifically, a much lower-level undertaking
+      than anything else attempted tonight.
+    - The core intermittent symptom itself (lid-open sometimes resumes
+      cleanly, sometimes leaves the screen dark until a power-button
+      press) is NOT root-caused. Verified via direct sysfs instrumentation
+      that `/sys/class/backlight/intel_backlight/bl_power` does NOT
+      reliably reflect the actual physical panel state on this hardware
+      (caught it reporting "on" for 4+ continuous seconds while the user
+      was directly looking at a black screen) -- so this exact sysfs
+      node cannot be trusted as a ground-truth signal for future
+      investigation; a different instrumentation approach (DRM connector
+      dpms state, or direct human-timed observation) would be needed.
+
+19. *** SUSPEND/WAKE: SOLVED *** s2idle + suspend-then-hibernate
+    THIS SUPERSEDES items 14, 15 and 19. Final working configuration:
+      /etc/systemd/sleep.conf:   MemorySleepMode=s2idle
+                                 HibernateDelaySec=15min
+      /etc/systemd/logind.conf:  HandleLidSwitch=suspend-then-hibernate
+
+    Behaviour: close the lid -> s2idle (wake in ~2s with a key tap).
+    If still closed after 15 min -> automatically performs a REAL
+    hibernate and fully powers off (fan stops). Waking from that takes
+    ~40s (Limine -> image restore) and returns the exact session, apps
+    still open. Verified end to end:
+      12:15:46  PM: suspend entry (s2idle)
+      12:16:17  PM: hibernation: hibernation entry   <- auto, 31s later
+      12:18:00  PM: hibernation: hibernation exit    <- same boot ID
+    User confirmed: fan physically stopped during hibernation, ~2-3s to
+    the Limine menu on wake, and all apps were still open afterwards.
+
+    WHY THIS WORKS WHERE THE EARLIER ATTEMPT FAILED (item 14):
+    suspend-then-hibernate needs to wake itself on a timer to perform the
+    transition. Under deep S3 that is impossible on this hardware -- the
+    RTC has no _PRW method in Apple's DSDT, so it is not a valid ACPI
+    wake source (see item 14 for the full DSDT evidence). Under s2idle
+    the machine is only FROZEN, not powered down, so an ordinary timer
+    interrupt is enough -- no ACPI wake source needed. Switching the
+    intermediate state from deep to s2idle is what unlocked it.
+
+    MEASURED POWER (on battery, energy_now deltas):
+      awake, idle          7.37 W
+      s2idle ("asleep")    4.16 W   <- only ~43% better than awake!
+      hibernated           ~0 W
+      one hibernate cycle  ~0.45 Wh fixed (write image + resume + POST)
+    Break-even: 0.45 Wh / 4.16 W = ~6.5 min. Any sleep longer than that
+    is cheaper hibernated. Battery cost of the 15 min delay window:
+    ~2.6% (s2idle) + ~1.1% (transition) = ~3.7% of a 40.6 Wh battery.
+    A 1h delay would have cost ~11.3%, which is why the systemd default
+    of 1h is a bad fit here -- that default assumes the intermediate
+    state is a real ~0.5 W S3, which this machine cannot use.
+
+    WHY NOT PLAIN deep S3 (the "obvious" answer): it is BROKEN and
+    genuinely unsafe on this machine. Wake took 9-40 s when it worked at
+    all, and it repeatedly hard-hung the laptop -- keyboard, trackpad,
+    power button, AC plug and USB all did nothing, requiring a ~10 s
+    forced power-off. BTRFS survived each time (`btrfs device stats`
+    all zeros) but that is luck, not a plan. Do not switch
+    MemorySleepMode back to deep.
+
+    ALSO CHANGED WHILE GETTING HERE (all kept, all verified):
+    - EC (PNP0C09) enabled as a wake source in /proc/acpi/wakeup.
+    - SPIT (APP000D, the Apple SPI keyboard/trackpad controller) enabled
+      as a wake source, persisted via /etc/systemd/system/
+      enable-spit-wake.service (ACPI wake states reset every boot).
+      This is what makes the 2 s key-tap wake work.
+    - Kernel cmdline: nvme_core.default_ps_max_latency_us=0 nvme.noacpi=1
+      (NVMe APST/ACPI power-state workarounds). Applied while deep S3 was
+      still in play; did NOT fix deep S3, but harmless and kept.
+    - /etc/systemd/system-sleep/disable-d3cold (drops d3cold_allowed to 0
+      on every sleep). Same story -- didn't fix deep S3, kept anyway.
+    - NetworkManager-wait-online.service disabled (was 4.174 s in
+      systemd-analyze blame). Small boot win. DISPROVEN as a cause of the
+      GDM/Plymouth delay -- plymouth-quit-wait stayed at 7.2 s with it
+      gone.
+
+    KNOWN REMAINING QUIRK (accepted, not a bug we can fix):
+    Opening the lid does NOT wake it from s2idle -- a key tap is needed.
+    The lid event IS received (PNP0C0D:00 wakeup counter increments and
+    logind logs "Lid opened"), but under s2idle the kernel only treats an
+    SCI as a wake if it came from a GPE armed specifically for wake, so
+    the event is processed without ending the s2idle loop. The keyboard
+    works because it goes via xHCI. Enabling EC/LID0/SPIT in
+    /proc/acpi/wakeup did not change this. Workflow is: open lid, tap a
+    key. Waking from the hibernated state uses the power button normally.
+
+    ALSO WORTH KNOWING: the fan cannot be stopped on this hardware.
+    Verified empirically -- stopped mbpfan, wrote 0 to both fan1_min and
+    fan1_output, and the SMC kept it at ~1190-1220 RPM for a full 60 s
+    while temps sat flat at 53-54 C. The writes are accepted (readback
+    changes) but the SMC firmware clamps actual behaviour to its own
+    ~1200 RPM floor. macOS idles these at ~1200 RPM too. mbpfan's
+    min_fan1_speed=1200 matches that floor and is already as quiet as
+    this machine gets. The fan DOES stop when genuinely hibernated,
+    which is a useful way to confirm hibernation actually happened.
+
+=====================================================================
+20. HARDWARE THERMAL MODS: physical repaste + heatsink-to-bottom-case pad
+    User did both, independently, with a standardized before/after
+    benchmark between each step (all-core stress-ng --cpu 4, 90s, at the
+    stock 3300MHz cap, always cooled down to a fixed starting temp first
+    so the three runs are genuinely comparable):
+      /tmp/thermalbench.sh <label>   -- waits for cooldown to a target
+      temp, runs the load, reports bogo-ops/s (real throughput -- the
+      metric that matters), max temp, fan RPM, throttle event count, and
+      throttle_total_time_ms (a far better metric than count alone, since
+      a handful of long stalls and many short blips can report similar
+      counts but very different actual impact).
+
+    RESULTS:
+                     bogo-ops/s   max temp   throttle time (of 90s)
+      stock            2662.80      97C      10.1%
+      + repaste        3303.67     100C      32.7%   <- see note below
+      + pad mod         3582.82     98C       0.0%   (3ms total)
+      Overall gain: +34.6% throughput, throttling essentially eliminated.
+
+    NOTE on the repaste-alone throttle% going UP while throughput ALSO
+    went up (not a contradiction): fresh paste lowers die-to-heatsink
+    thermal resistance, so the chip both HEATS to the 100C ceiling faster
+    under load AND cools/recovers faster once it backs off -- net effect
+    is more frequent but much shorter throttle blips, with more real work
+    done between them. bogo-ops/s (actual throughput) is the trustworthy
+    number here, not the throttle percentage in isolation.
+
+    The pad mod (bridging the heatsink to the aluminum bottom case with
+    thermal pad) is what actually fixed the underlying problem: the
+    heatsink alone was saturating and had nowhere further to put the
+    heat, causing the repeated throttle cycling seen above. Giving it a
+    second path into the whole bottom case removed that ceiling almost
+    entirely -- same peak temp (~98C) but the machine can now sit there
+    continuously instead of bouncing off it.
+
+    Idle floor also dropped sharply as a side effect: ~68-73C before ->
+    ~52-54C after both mods, at true idle on AC.
+
+    Machine: MacBookAir6,1 (A1465, 11"), i7-4650U. Physical work (paste
+    application, pad placement) done by the user; measurement/comparison
+    done remotely via SSH. No specific thickness spec exists for this
+    model in the community (mod is mostly documented for fanless M1/M2
+    Airs) -- gap was measured directly via the squashed-clay technique
+    rather than assumed.
+
+=====================================================================
+21. RAPL POWER LIMITS (PL1/PL2); CORRECTION BELOW: enforcement is NOT
+    functional on this platform. Kept as documentation-only/harmless.
+    *** IMPORTANT CORRECTION (found immediately after writing the below):
+    the throughput comparison across 10W/15W/20W/uncapped was NOT showing
+    "no cost to staying within spec" -- it was showing that NONE of these
+    settings were ever actually being enforced. Verified directly:
+      - Raw MSR read (0x610, MSR_PKG_POWER_LIMIT) after setting PL1=10W:
+        decodes correctly to PL1=10W enabled+clamped, PL2=25W enabled,
+        LOCK BIT CLEAR (not locked, unlike the voltage mailbox/C-state
+        MSRs found earlier tonight -- confirmed via MSR_RAPL_POWER_UNIT
+        0x606 for the 0.125W/unit scaling). So the register itself is
+        correctly configured, unlocked, and enabled.
+      - Despite that, measured ACTUAL sustained package power (via
+        intel-rapl energy_uj deltas) over a full 80-second continuous
+        load with PL1=10W active: flat 21.6-23.0W the ENTIRE time, never
+        approaching 10W at any point, even though 80s is more than 3x
+        the ~24.6s PL1 averaging window (RAPL enforces a rolling average,
+        not an instant cutoff, so a short sample can't rule this out --
+        an 80s sample can).
+    CONCLUSION: RAPL power-limit enforcement does not functionally work
+    on this platform/microcode, regardless of what value is configured.
+    The register faithfully stores and reflects whatever is written, but
+    the CPU's power control unit does not act on it -- the chip just
+    runs at its natural ~22-23W thermally-limited draw regardless.
+    set-rapl-limits.service is harmless (replaces a nonsensical 100W/
+    125W-with-2.44ms-window placeholder with honest, documented 15W/25W
+    values) but has NO actual effect on real CPU behaviour on this
+    hardware. Do not rely on RAPL for power/thermal control here -- the
+    only things that actually changed real behaviour tonight were the
+    physical thermal mods (item 20: repaste + heatsink-to-case pad).
+    Left enabled anyway since it's zero-cost and self-documenting; not
+    worth chasing further (would mean digging into PCU/microcode
+    internals, well past what's reasonable to pursue here).
+
+    ORIGINAL (now-corrected) writeup follows, for the record of what was
+    actually tested and measured:
+    Discovered while investigating the throttling seen in item 20's
+    "before" numbers: this platform's firmware ships RAPL with
+    essentially no real limit at all --
+      PL1 (sustained):  100 W   (chip's actual TDP is 15 W)
+      PL2 (short-term): 125 W,  with a 2.44 ms time window (should be
+                                 several seconds -- this window is so
+                                 short it's functionally meaningless)
+    So the CPU was running purely thermally-limited with no designed
+    power budget, relying entirely on hitting 100C as its only guardrail
+    -- consistent with the throttle-thrash behaviour measured in item 20.
+
+    Set via the standard powercap interface (safe, no MSR unlock needed
+    -- this is a different MSR/mechanism than the undervolt mailbox that
+    hit OC_LOCK earlier tonight):
+      /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_0_power_limit_uw
+      /sys/class/powercap/intel-rapl/intel-rapl:0/constraint_1_power_limit_uw
+    Persisted via /usr/local/bin/set-rapl-limits.sh +
+    /etc/systemd/system/set-rapl-limits.service (enabled, multi-user.target
+    -- powercap values reset to firmware defaults every boot, same as
+    ACPI wakeup/MSR states elsewhere in this file).
+
+    TESTED THREE CONFIGURATIONS, same standardized thermalbench.sh, same
+    stock 3300MHz cap, same cooldown-to-55C-first methodology as item 20:
+                           bogo-ops/s   max temp   throttle%
+      "uncapped" (broken)   3582.82       98C        0.0%
+      PL1=20W / PL2=28W     3575.03       99C        0.4%
+      PL1=15W / PL2=25W     3636.80       99C        0.3%   <- CHOSEN
+    All three within ~2% of each other -- noise, not a real difference.
+    Also independently measured actual sustained package power draw
+    during load (via intel-rapl energy_uj counter) BEFORE setting any
+    limit: ~22.2 W steady-state at "uncapped" settings -- i.e. even with
+    no power limit at all, the improved cooling never pushed the chip
+    meaningfully above what a sane limit would allow anyway.
+
+    CHOSE SPEC VALUES (PL1=15W/PL2=25W), NOT the more aggressive 20W/28W
+    initially proposed: the pad mod + repaste improved cooling enough
+    that the chip does not need to exceed its documented 15W TDP to hit
+    full sustained performance -- there is no measurable throughput cost
+    to staying within Intel's validated envelope, so the conservative
+    choice (better for long-term VRM/battery/thermal-cycling wear) was
+    free. PL1 window ~24.6s, PL2 window ~8s (both requested as 28s/8s;
+    RAPL's time-window encoding only supports discrete steps, so they
+    were quantized slightly by hardware -- both close enough to intended
+    and this is normal, not a bug).
+
+    NOTE: one comparison run (PL1=15W/PL2=25W, first attempt) got
+    contaminated by multiple overlapping test invocations left running
+    concurrently from earlier interrupted attempts, producing 3 different
+    inconsistent result sets in the same log window. Confirmed nothing
+    was still running (`ps aux | grep stress-ng`), then reran once,
+    cleanly, in isolation -- that clean rerun (3636.80 bogo-ops/s) is the
+    number used above. If retesting RAPL values in the future, always
+    verify no stray stress-ng/thermalbench processes are running first.
+
+    FOLLOW-UP that revealed the correction above: also tested PL1=10W
+    (PL2 left at 25W) -- 3619.05 bogo-ops/s, 99C, 0.2% throttle, again
+    statistically identical to every other setting tried. That prompted
+    directly measuring real sustained power draw (intel-rapl energy_uj
+    delta) rather than trusting the throughput numbers alone: ~22.6W
+    over a quick sample, then confirmed with a full 80-second continuous
+    sample at 8s intervals (21.6-23.0W throughout, never dropping toward
+    10W). This is what led to decoding the raw MSR 0x610 and discovering
+    RAPL enforcement itself doesn't function on this platform (see
+    correction at the top of this item).
+
+=====================================================================
+KNOWN OUTSTANDING / NOT YET DONE
+=====================================================================
+
+- MBPFAN: investigated, NOT actually installed despite earlier
+  instructions being given (checked and confirmed /etc/mbpfan.conf does
+  not exist, service inactive). Symptom noticed: fan pinned at
+  6498/6500 RPM continuously even at a cool 56C CPU temp; because with
+  no fan daemon running, Linux doesn't drive Apple's SMC fan curve
+  intelligently and the fan sits near max as a safety fallback. This is
+  NOT a thermal-paste/hardware problem, just a missing daemon. Exact
+  commands given (not yet confirmed run):
+      sudo pacman -S paru
+      paru -S mbpfan
+      sudo tee /etc/mbpfan.conf <<'MBPEOF'
+      [general]
+      min_fan1_speed = 1200
+      max_fan1_speed = 6500
+      low_temp = 63
+      high_temp = 66
+      max_temp = 86
+      polling_interval = 7
+      MBPEOF
+      sudo systemctl enable --now mbpfan
+  Note this uses gentler community-typical thresholds (63/66/86/poll=7)
+  than the old Pop!_OS config (65/75/80/poll=1), but this exact unit's
+  real hardware fan floor/ceiling (1200/6500, confirmed via
+  /sys/devices/platform/applesmc.768/fan1_min and fan1_max) rather than
+  the generic community default floor of 2000.
+
+- COMPRESSION LEFT AT compress=zstd:1 (Calamares's default); DELIBERATE
+  CHOICE, not an oversight. Real benchmarking (zstd CLI across levels
+  1-19 on this exact i7-4650U CPU, cross-referenced against a real
+  O_DIRECT disk throughput measurement of ~127MB/s sequential write) found
+  zstd:3 (~131-140MB/s single-thread compression speed) as the highest
+  level that still clears the real write bottleneck, with zstd:1 giving
+  more headroom/less compression (~230-240MB/s, ratio 2.47x vs zstd:3's
+  2.68x). Decided to keep the safer zstd:1 default rather than move to
+  zstd:3; worth reconsidering later if storage pressure becomes an issue,
+  since zstd:3 remains comfortably within budget on this hardware if
+  reconsidered:
+      sudo mount -o remount,compress=zstd:3 /
+      sudo sed -i 's/compress=zstd:1/compress=zstd:3/g' /etc/fstab
+
+- No dedicated @libvirt subvolume with nodatacow for VM disk images.
+  Relevant because the old Pop!_OS box ran a Windows 10 VM with GPU
+  passthrough (win10_MZ.xml in libvirt, a patched vBIOS ROM); default
+  BTRFS copy-on-write badly fragments VM disk images. If VMs come back on
+  this install, create a subvolume for /var/lib/libvirt and run
+  `chattr +C` on it while empty (mount-option nodatacow does NOT work
+  per-subvolume on a shared block device; this was independently
+  confirmed mid-install: compress/ssd/discard/space_cache are filesystem-
+  wide options tied to the whole device, not settable per-subvolume via
+  mount options; only the chattr +C inode attribute achieves per-subvolume
+  nocow).
+
+- No @snapshots subvolume / snapper set up for limine-snapper-sync-style
+  boot-time rollback entries.
+
+- Most of the old Pop!_OS box has now been ported (see items above:
+  mbpfan, TLP, no_batt_fix). Full details of what that machine had
+  customized are in:
+      /mnt/backups/popos-config-audit/CONFIG_CHANGES_SUMMARY.md
+      (on this box: /dev/nvme0n1p6, mount with
+       `sudo mount -o ro /dev/nvme0n1p6 /mnt/backups` if not mounted)
+  Still pending: broadcom-sta-dkms wifi driver swap (currently unknown
+  which driver this box's wifi actually uses; not checked), GNOME
+  night-light/dark-theme/desktop settings, sysctl tweaks (magic-sysrq
+  value, IPv6 disable), saved NetworkManager Wi-Fi/VPN profiles (46 of
+  them), Timeshift/Vorta backup tooling, and the resume-hook coverage
+  gap noted in item 17 for no_batt_fix.
+
+=====================================================================
+HARDWARE REFERENCE (why some of the above decisions were made)
+=====================================================================
+SSD: Crucial P2 2TB (CT2000P2SSD8), DRAM-less QLC NAND, native interface
+     PCIe 3.0 x4 (rated up to ~2400MB/s read / ~1800MB/s write).
+Link: negotiated at PCIe 2.0 x4 on this Mac's SSD slot (~2.0GB/s raw /
+      ~1.6-1.8GB/s realistic ceiling); not the drive's fault, the slot
+      itself only does Gen2.
+Measured real throughput (O_DIRECT, large blocks, bypassing page cache):
+      ~493MB/s sequential read, ~127MB/s sequential write.
+      (An earlier buffered small-block dd test showed a misleadingly low
+      ~98MB/s read; that was a benchmarking-methodology artifact, not the
+      real hardware limit.)
+CPU: Intel Core i7-4650U @ 1.70GHz (Haswell-ULT), 2C/4T, max 3.3GHz.
+
+=====================================================================
+22. CPU MAX FREQUENCY CAP: set to 2.8GHz permanently, chosen after
+    RAPL was proven non-functional (item 21). Frequency capping IS a
+    real, working lever on this hardware (unlike RAPL): it directly
+    moves the P-state ceiling and, per Intel's fixed V/F curve, the
+    voltage that goes with it.
+
+    NOTE: this was investigated again after the thermal mods (item 20)
+    had already been logged as fully eliminating throttling (0.0-0.4%)
+    at the full stock 3300MHz cap. A fresh uncapped-3300MHz test this
+    session showed real throttling again (99C, 2409ms/90s, ~2.7%) --
+    NOT reproducing the earlier 0.0% result. Cause not conclusively
+    identified (ambient temp, ambient humidity, ordinary paste/pad
+    settling over time, ordinary run-to-run variance are all plausible;
+    not chased further since capping the frequency resolves it either
+    way). Worth re-checking if throttling behavior seems to drift again.
+
+    THERMAL TEST (freqcap-thermaltest.sh <khz>: cooldown to <=60C, then
+    90s all-core stress-ng --cpu 4, sampling temp/fan/freq every 10s):
+      cap        max temp   throttle_time_ms (of 90s)
+      3300MHz      99C        2409   (stock/uncapped -- see note above)
+      3000MHz     100C        6813   (hit crit ceiling -- worst of all)
+      2900MHz      98C          17   (noise-level, effectively clean)
+      2850MHz*     94C           0   (*settles to 2800MHz bin in practice)
+      2800MHz      96C           0
+      2700MHz      93C           0
+      2600MHz      90C           0
+      2500MHz      87C           0
+      2400MHz      85C           0
+    Clear cliff between 2900MHz (clean) and 3000MHz (real throttling,
+    worse even than stock 3300). CHOSE 2800MHz: highest bin with a
+    clean 0ms result and a full margin step below 2900's noise-level 17ms,
+    rather than riding the exact edge of the cliff.
+
+    P-STATE GRANULARITY: setting scaling_max_freq to a value between
+    real P-state bins (tested 2850000) silently rounds DOWN to the
+    nearest bin (settled at ~2800MHz under load) -- bins are ~100MHz
+    apart on this hardware, matching earlier freqsweep.sh findings.
+
+    Persisted via /usr/local/bin/set-freq-cap.sh (writes 2800000 to all
+    4 cores' scaling_max_freq) + /etc/systemd/system/set-freq-cap.service
+    (enabled, multi-user.target -- resets to hardware default every boot
+    otherwise, same pattern as every other MSR/ACPI/powercap state in
+    this file).
+
+    EFFICIENCY SWEEP (freq-efficiency-sweep.sh: for each freq, settle 3s,
+    then measure real watts via intel-rapl energy_uj delta + throughput
+    via stress-ng bogo-ops/s over a 20s all-core run -- RAPL as a
+    MEASUREMENT tool works fine, only enforcement is broken):
+      freq_kHz   watts   bogo-ops/s   bogo-ops/W (efficiency)
+      800000     5.43     972.81       179.2
+      1000000    6.17    1228.82       199.2
+      1200000    6.81    1452.43       213.3
+      1400000    7.73    1717.17       222.1
+      1600000    8.66    1967.90       227.2   <- peak efficiency
+      1800000   10.22    2213.16       216.6
+      2000000   11.58    2480.47       214.2
+      2200000   13.47    2728.44       202.6
+      2400000   15.66    2974.22       189.9
+      2600000   18.22    3096.40       169.9
+      2800000   20.89    3505.66       167.8
+      2900000   22.48    3563.06       158.5
+      3300000   22.57    3609.50       159.9
+    Inverted-U curve: efficiency peaks at 1600MHz, broad plateau
+    1400-2000MHz within ~3% of peak. Below ~1200MHz efficiency drops
+    again -- a fixed uncore/leakage power floor doesn't scale down with
+    frequency, so very low clocks pay a fixed tax that dominates at
+    light load. Above ~2000MHz, voltage-scaling cost outpaces throughput
+    gain and efficiency falls steadily.
+    Sanity check: 2900MHz and 3300MHz draw essentially identical power
+    (22.48W vs 22.57W) -- consistent with item 21's finding that this
+    chip naturally settles around ~22-23W regardless of nominal cap.
+
+    BATTERY-MODE IMPLICATION (raised, not yet applied): TLP currently
+    caps CPU to 1200MHz on battery, which is BELOW the measured
+    efficiency peak (1200MHz = 213.3 ops/W vs 1600MHz's 227.2 ops/W,
+    ~+6.5% more work per Wh at full continuous load). However, this
+    ops/W figure is for CONTINUOUS full-core load -- for typical bursty/
+    idle-heavy battery usage, race-to-idle (finish fast, drop to a deep
+    idle C-state) can favor a higher cap even at lower steady-state
+    efficiency, since idle power dominates duty-cycled workloads more
+    than active efficiency does. Decision on the actual battery cap
+    value deferred pending that runtime-vs-duty-cycle tradeoff, not a
+    pure peak-efficiency pick.
+
+    Scripts saved: /mnt/backups/scripts/{freqcap-thermaltest.sh,
+    freq-efficiency-sweep.sh,set-rapl-limits.sh}
+
+    *** ADDENDUM (2026-09-12, after further testing): final decision made. ***
+    AC cap CONFIRMED at 2800000 (matches this item's finding above).
+    FIXED a real conflict found while finalizing: /etc/tlp.conf still
+    had CPU_SCALING_MAX_FREQ_ON_AC=3300000 -- TLP reapplies its AC/BAT
+    caps on every power-source change (plug/unplug), so the next AC
+    reconnect would have silently reverted set-freq-cap.service's
+    2800MHz back to 3300MHz. Changed tlp.conf's ON_AC value to
+    2800000 to match.
+
+    Battery cap DECIDED: 1600000 (1.6GHz), overriding the previous
+    1200000 default -- a deliberate performance-over-runtime choice.
+    Ran a REAL battery-runtime test (not just the ops/W efficiency
+    sweep above) to check the tradeoff properly: battery-runtime-
+    sweep.sh, moderate 2-core load, 5 min per cap, power measured via
+    whole-system battery energy_now delta (not just CPU package like
+    RAPL/intel-rapl):
+      cap        watts (whole system)   projected runtime
+      1200MHz    14.88 W                2:44 (h:mm)
+      1400MHz    16.08 W                2:31
+      1600MHz    17.16 W                2:22
+    Runtime drops MONOTONICALLY as cap rises under continuous load --
+    there is no efficiency "sweet spot" for pure runtime the way there
+    was for ops/W (that peak-efficiency number only matters if you're
+    racing to finish a fixed task and then idling, not for "how long
+    can this run"). Chose 1600MHz anyway, prioritizing performance;
+    the cost is the ~22 fewer minutes of runtime shown above under
+    sustained load (idle-heavy usage would cost less, since CPU draw
+    is a smaller share of total system power at idle). Revisit toward
+    1200MHz if runtime becomes the priority again.
+
+    Set: /etc/tlp.conf CPU_SCALING_MAX_FREQ_ON_BAT=1600000 (was
+    1200000). Applied live via `sudo tlp start`, confirmed on all 4
+    cores.
+
+    Scripts saved: /mnt/backups/scripts/battery-runtime-sweep.sh added
+    to the existing set.
+
+23. HIBERNATE FREEZE: ROOT CAUSE FOUND, FIX APPLIED (extends item 13)
+    New, more specific finding than item 13's "intermittent, no known
+    trigger": one concrete freeze signature was root-caused. Lid-closed
+    while HandleLidSwitch=suspend-then-hibernate was active -> s2idle
+    suspend succeeded -> 15min later transitioned to real hibernate ->
+    froze permanently right at `PM: hibernation: hibernation entry`,
+    zero further log output, requiring a hard cold boot. Confirmed on
+    next boot: `PM: Image not found (code -22)`; the hibernation image
+    write never completed.
+    ROOT CAUSE THEORY: the `facetimehd` webcam driver does a full
+    firmware/DMA reinit on every resume from s2idle. It had just gone
+    through that resume dance seconds before systemd tried to refreeze
+    everything for the hibernate transition; a driver failing to
+    cleanly re-suspend that soon after a fragile resume is the likely
+    hang point.
+    FIX APPLIED: /etc/systemd/system-sleep/facetimehd (root:root, 0755):
+      #!/bin/bash
+      case $1 in
+        pre)  modprobe -r facetimehd 2>/dev/null ;;
+        post) modprobe facetimehd 2>/dev/null ;;
+      esac
+    Unloads the driver before every sleep transition, reloads fresh
+    after. STILL ACTIVE as of 2026-09-13. Validated across multiple real
+    hibernate cycles the same night with no recurrence of this exact
+    freeze signature (see item 24 below for the cycles that exercised
+    this repeatedly).
+
+24. SUSPEND-THEN-HIBERNATE: RE-ENABLED, RTC RETRIGGER LOOP FOUND +
+    FIXED (2026-09-13 session; updates item 14's status)
+    IMPORTANT STATE CHANGE: HandleLidSwitch is back to
+    `suspend-then-hibernate` (confirmed live, 2026-09-13); NOT `suspend`
+    as item 14 left it. Unclear exactly when/why it was switched back
+    between sessions; found already active at the start of this
+    investigation and, given the fix below, left that way deliberately
+    this time rather than reverting again.
+    NEW SYMPTOM FOUND: a ~102-second self-retriggering suspend loop, no
+    lid event involved; `Suspending, then hibernating...` firing
+    machine-precise every ~102s for up to 18 cycles in a row before
+    finally settling into a real hibernate. Root-caused (with web
+    research matching known systemd/RTC-wakealarm bugs on other
+    hardware, and a MacBookAir6,x-specific report of the same
+    LID0/RTC-wake entanglement) to the RTC wakealarm handshake between
+    systemd-sleep and the `rtc_cmos` driver misfiring; the alarm set to
+    check "should I hibernate now" fires early/wrong instead of waiting
+    out the real interval.
+    FIX APPLIED: kernel parameter `rtc_cmos.use_acpi_alarm=1` (added via
+    /etc/default/limine KERNEL_CMDLINE, see item 25 for why that file
+    not /etc/kernel/cmdline); makes the rtc_cmos driver arm/read the
+    wake alarm through ACPI-mediated methods instead of raw legacy CMOS
+    register pokes, letting firmware stay in the loop for the
+    arm->sleep->fire->wake handshake.
+    VALIDATED: an isolated `rtcwake -m mem -s 60` test passed cleanly
+    first (single suspend/resume, no early wake), then multiple REAL
+    lid-close end-to-end cycles (with HibernateDelaySec temporarily at
+    1min for fast testing) all came back clean; Lid closed -> suspend
+    (s2idle) -> stayed asleep the full interval -> hibernation entry ->
+    stayed hibernated until lid reopened -> clean hibernation exit, zero
+    retrigger-loop recurrences across at least 4 separate test cycles.
+    HibernateDelaySec restored to 15min afterward (normal value).
+    HONEST CAVEAT: `/proc/acpi/wakeup` still shows no RTC line at all on
+    this hardware (matching item 14's original deep-dive finding); this
+    fix did NOT make RTC appear as a GPE wake source in that table, it
+    fixed the specific self-retrigger symptom via a different mechanism
+    (how the alarm gets armed/read, not whether it's GPE-listed). Item
+    15's architectural finding may still be technically true in a way
+    this doesn't fully contradict; what's confirmed is the practical
+    symptom (the retrigger loop) is gone and repeatedly validated.
+    ALSO FOUND SEPARATELY, STILL UNRESOLVED: real (not RTC-related)
+    `Lid closed`/`Lid opened` ACPI events firing at short, frequent
+    intervals (30-90s), each with a genuine lid-event log line (unlike
+    the RTC loop above, which had none). Root cause not identified; could be hinge/sensor wear (14yo hardware) or a firmware-level
+    quirk; user maintains it's software, not hardware. `HandleLidSwitch=
+    ignore` was tested as a workaround (confirmed it stops the false
+    signal from triggering suspend) but explicitly REJECTED by user
+    preference and reverted; HandleLidSwitch stays at
+    suspend-then-hibernate per above, phantom lid signal accepted as-is
+    for now.
+
+25. ADDITIONAL SLEEP/WAKE-SOURCE FIXES (same 2026-09-13 investigation,
+    found via web research into other Linux-on-Intel-Mac quirks; see
+    Dunedan/mbp-2016-linux#207 on GitHub, and multiple Ubuntu launchpad
+    bugs on this exact MacBookAir6,x hardware generation)
+    - XHC1 (USB/Bluetooth xHCI controller, PCI 0000:00:14.0) was
+      `*enabled` as an S3 ACPI wake source; matches a well-documented
+      "MacBook Air resumes immediately after suspend" bug class on this
+      exact hardware generation, separate mechanism from item 24's RTC
+      issue. FIX: /etc/udev/rules.d/90-xhc_sleep.rules; `SUBSYSTEM=="pci", KERNEL=="0000:00:14.0", ATTR{power/wakeup}=
+      "disabled"`. Side effect: this controller also carries the
+      internal Bluetooth chip on this Mac generation, so BT peripherals
+      can no longer wake the machine from suspend (not normally missed
+      on a laptop).
+    - `acpi_sleep=nonvs` kernel parameter; skips saving/restoring the
+      ACPI NVS memory region across suspend/resume, a common workaround
+      for firmware that mishandles it.
+    - `button.lid_init_state=open` kernel parameter; forces the ACPI
+      lid button driver to assume open at boot regardless of what the
+      lid GPE first reports, avoiding a boot-time-desynced lid state
+      machine.
+    - `i915.enable_dc=0 i915.enable_fbc=0 i915.enable_psr=0`; disables
+      Intel GPU display power-saving states (DC states, framebuffer
+      compression, panel self-refresh). Speculative fit for a separate
+      symptom (192 recurring `Cursor update failed: drmModeAtomicCommit`
+      gnome-shell/DRM errors seen in one problem boot); cursor error
+      count dropped to 2 (both benign, at a sleep transition) in the
+      next boot with these active, looking good but not confirmed over
+      many sessions of normal use yet.
+    ALL FOUR (plus item 24's rtc_cmos.use_acpi_alarm=1) added via
+    /etc/default/limine's KERNEL_CMDLINE[default] (NOT /etc/kernel/
+    cmdline; this system's `limine-entry-tool`/mkinitcpio setup reads
+    cmdline from /etc/default/limine if it's set there, which it is;
+    /etc/kernel/cmdline is only a fallback and gets ignored when
+    /etc/default/limine already has KERNEL_CMDLINE[default] populated; wasted real effort discovering this, check /etc/default/limine
+    FIRST for any future cmdline change on this machine). Apply via
+    `sudo limine-update` after editing, which rebuilds initramfs for all
+    kernels and regenerates /boot/limine.conf (including its embedded
+    initramfs checksums) in one step.
+
+26. DEEP (REAL S3) SLEEP: TESTED, CONCLUSIVELY REJECTED
+    Out of curiosity (isolated `rtcwake -m mem` tests completed cleanly
+    at the kernel PM level), tried switching MemorySleepMode=deep for a
+    real lid-close test. Kernel-level result looked fine (clean
+    suspend/exit, no hang), but the SCREEN did not wake on lid-open,
+    requiring a power-button press to actually restore the display.
+    This is the exact black-screen-on-resume symptom the Dunedan/
+    mbp-2016-linux#207 research warned about for real S3 on Mac
+    hardware. Reverted to MemorySleepMode=s2idle immediately (item 25's
+    current setting); empirically confirmed, not just community
+    folklore, that deep sleep is unusable on this machine for normal
+    lid-close/open use. Considered (but rejected as too disruptive) an
+    i915 driver unload/reload hook as a possible fix, similar to item
+    24's facetimehd hook; checked i915's usage count first and found
+    it fundamentally different: i915 has 31 active users (the live GPU
+    driving the desktop) vs facetimehd's 0, so unloading it would
+    require tearing down the whole graphical session (stop gdm ->
+    unload -> sleep -> reload -> restart gdm), trading "press power
+    button once" for "session visibly restarts every sleep cycle." Not
+    worth it given s2idle already works completely. DO NOT re-suggest
+    switching to `deep` on this machine without new information.
+
+27. BATTERY HEALTH: INVESTIGATED, REAL ANSWER IS 84.5%, NOT A FAKE/
+    MISMATCHED BATTERY (2026-09-13; full detail in the separate
+    /mnt/backups/macbook_air_battery_health_research.txt file, kept
+    apart from this one the same way the undervolt research is)
+    `upower`/GNOME showed 84.5% battery "capacity" health, prompting
+    suspicion this might be a non-genuine/mismatched replacement pack.
+    Investigation went through a wrong intermediate conclusion (~104%,
+    theorized the 48Wh design-capacity figure was bogus) before getting
+    real ground truth from booting macOS and reading the raw IOKit
+    battery data: DesignCapacity=4800 mAh, MaxCapacity=4058 mAh (native,
+    unambiguous units, no conversion needed) -> real health = 4058/4800
+    = 84.5%, exactly matching the original Linux/upower figure all
+    along. CycleCount=299 of a 1000-cycle rated life (~30% used),
+    Manufacturer=SMP (Simplo, genuine Apple-approved supplier), real
+    Serial=C01514309YEF90MA4 (matches genuine Apple format).
+    CONCLUSION: 84.5% is real, genuine, moderate aging for a 13-year-old
+    pack with 299 real cycles on it; NOT evidence of a counterfeit or
+    mismatched battery. The battery is fine, just not fresh. Don't
+    re-litigate this if it comes up again; it's a settled, cross-
+    verified answer (Linux raw values + macOS IOKit ground truth agree
+    exactly), not an open question.
+
+28. ACPI BATTERY INFO FIX (_BIX for real cycle count/serial number in
+    Linux); FIRST ATTEMPT CAUSED A KERNEL PANIC, REAL INCIDENT
+    (2026-09-13)
+    Goal: Linux shows cycle_count=0 and blank serial_number for BAT0
+    because Apple's DSDT only implements the older `_BIF` ACPI battery
+    method (no cycle-count field exists in that format at all) and
+    hardcodes serial number blank rather than reading it. Built a small
+    supplemental SSDT adding a real `_BIX` method (live SMBus reads via
+    the same trusted \_SB.PCI0.LPCB.EC.SMB0.SBRW/SBRB primitives Apple's
+    own DSDT already uses, standard SBS command codes 0x17=CycleCount,
+    0x1C=SerialNumber); purely additive, doesn't touch/replace the
+    existing _BIF/UBIF/UBST at all.
+    FIRST DELIVERY MECHANISM (silently inert, no harm): a custom
+    mkinitcpio hook using `add_file`; landed in the wrong initramfs
+    segment (the main archive, not the special early/uncompressed one
+    ACPI_TABLE_UPGRADE actually scans), so it just never took effect.
+    SECOND DELIVERY MECHANISM (CAUSED A REAL KERNEL PANIC): built a
+    standalone early cpio by hand and added it as a SECOND Limine boot
+    module (via `initrd=` in KERNEL_CMDLINE, which limine-entry-tool
+    auto-converts to an extra `module_path:` line), assuming it would
+    concatenate the same way microcode+initramfs already do. This was
+    an UNVERIFIED assumption pushed straight to the daily-driver machine
+    without a tested fallback. It caused a kernel panic; the user had to
+    manually intervene to recover (bypass/edit the boot entry
+    themselves). Immediately cleaned up: removed the `initrd=` line from
+    /etc/default/limine, regenerated via limine-update, confirmed the
+    extra module_path is gone and config matches the pre-_BIX-work
+    baseline (items 25/26) exactly. Deleted /boot/acpi-override.cpio and
+    /usr/lib/acpi-override/.
+    ROOT CAUSE FOUND AFTERWARD: mkinitcpio ALREADY ships an official,
+    purpose-built `acpi_override` hook for exactly this
+    (/usr/lib/initcpio/install/acpi_override, part of the mkinitcpio
+    package itself) that uses the correct `add_file_early` function to
+    place .aml files into the SAME proven early-cpio segment microcode
+    already uses every boot. My custom hook used the wrong function
+    (`add_file`) AND had the identical filename, likely shadowing the
+    real one. Should have checked for an existing hook of that name
+    first.
+    THIRD ATTEMPT (safer, uses the real official hook, not yet reboot-
+    tested as of this writing): removed the custom
+    /etc/initcpio/install/acpi_override entirely. Placed the compiled
+    .aml at /etc/initcpio/acpi_override/battery-bix-fix.aml (the real
+    hook's expected search path). Re-added `HOOKS+=(acpi_override)` via
+    /etc/mkinitcpio.conf.d/20-acpi-override.conf (now correctly
+    resolving to the REAL system hook). Rebuilt via `mkinitcpio -P` then
+    `limine-update` (to refresh limine.conf's embedded initramfs
+    checksum). VERIFIED via direct byte-offset inspection of the built
+    initramfs that the .aml genuinely landed in the early/uncompressed
+    segment this time (before the zstd-compressed main archive begins),
+    alongside the real microcode file; much higher confidence than the
+    previous attempt since this reuses infrastructure already proven
+    every single boot, rather than hand-built/unverified mechanics. NO
+    second Limine module this time; stays inside the single existing
+    initramfs.
+    STATUS AT TIME OF WRITING: staged, not yet reboot-tested. If it
+    works: cycle_count/serial_number should populate correctly in
+    /sys/class/power_supply/BAT0/ with no further action needed
+    (Linux's generic ACPI battery driver auto-prefers _BIX over _BIF).
+    If it fails again: this uses only mkinitcpio's own official,
+    already-proven mechanism, so recovery should be standard
+    `mkinitcpio` troubleshooting (rescue boot, remove
+    /etc/initcpio/acpi_override/*.aml and the HOOKS drop-in, rebuild); not the ad-hoc mess the second attempt required. Given item 27
+    already fully answers the actual battery-health question (84.5%,
+    genuine), this _BIX work is a minor cosmetic nice-to-have
+    (cycle_count/serial_number display only); not worth much further
+    risk if this third attempt also doesn't pan out.
+
+    *** RESOLVED (2026-09-13, same night): the actual bug was found and
+    fixed - real cycle_count/serial_number ARE now working. ***
+    Root cause of ALL prior failures (including the kernel panic):
+    never about load order, override-vs-new-table semantics, or Scope()
+    vs full-pathname syntax (all seriously investigated in turn). It was
+    one wrong assumption the whole time - the real ACPI path for the
+    battery device is `\_SB.BAT0` (direct child of the system bus), NOT
+    `\_SB.PCI0.LPCB.EC.BAT0` as misread from the DSDT's indentation
+    (Apple's own AML always uses fully-qualified absolute paths for its
+    SMBus calls regardless of actual nesting depth, which is what caused
+    the misread). Confirmed via `readlink -f
+    /sys/class/power_supply/BAT0/device` -> PNP0C0A:00, and
+    `cat .../device/path` -> `\_SB_.BAT0`. Every attempt with the wrong
+    path failed identically with "Object does not exist: BAT0" -
+    including a live, no-reboot test via ACPI configfs
+    (/sys/kernel/config/acpi/table/, `modprobe acpi_configfs`) done 338
+    seconds into a fully running session, which proved the failure was
+    never about timing at all (BAT0 unquestionably exists by then) and
+    forced re-checking the path, which is what actually found the bug.
+
+    FIX: corrected the SSDT to declare `_BIX` at `\_SB.BAT0._BIX` (full
+    pathname, no Scope()), same live SMBus reads as before via the
+    existing \_SB.PCI0.LPCB.EC.SMB0.SBRW/SBRB primitives. Deployed via
+    the same official mkinitcpio acpi_override hook (already staged).
+    Rebooted - loaded with ZERO ACPI errors this time, and the battery
+    driver's initial boot-time probe picked up _BIX correctly (confirmed
+    it only decides _BIF-vs-_BIX ONCE at that probe - loading _BIX later
+    via configfs after boot does NOT retroactively change the decision;
+    neither `udevadm trigger` nor a suspend/resume cycle forces a
+    re-probe, only a fresh boot with _BIX already present does).
+
+    CONFIRMED WORKING, cross-checked against the macOS ground truth from
+    item 27:
+      cycle_count:         299        (matches macOS exactly)
+      serial (FirmwareSerialNumber): 100  (matches macOS's own
+                                            "FirmwareSerialNumber" field
+                                            exactly - not garbage, a real
+                                            documented SBS field)
+      charge_full:          4058 mAh  (matches macOS exactly)
+      charge_full_design:   4800 mAh  (matches macOS exactly)
+      upower energy-full:   30.84 Wh  (now correctly computed from real
+                                        mAh x voltage, instead of Apple's
+                                        mislabeled x10 approximation -
+                                        resolves that earlier ambiguity
+                                        from item 27 too)
+    model_name/manufacturer initially still showed pre-existing cosmetic
+    string garbling (e.g. "bq20z45189ABCDEF0123456789ABCDE" instead of
+    just "bq20z451") - SAME NIGHT, ALSO RESOLVED, see below.
+
+    *** model_name/manufacturer garbling - RESOLVED, no hardcoding ***
+    Tried ToString() to trim at the first null byte - did NOT work
+    (confirmed after reboot, still garbled). Root cause: SBFR (the EC
+    field these block-read strings come from) is a FIXED 256-bit/32-byte
+    buffer per the DSDT's own field declaration - only the first N bytes
+    of any given transaction are real, the rest is leftover/unused buffer
+    content (non-null ASCII, not zeros), with the only null byte at the
+    very end of the full 32 bytes - so there's no early null for
+    ToString() to stop at.
+    User explicitly rejected hardcoding the known-correct strings as a
+    shortcut ("no hardcoding") when offered - correctly, since it would
+    silently go stale if the physical battery were ever swapped.
+    REAL FIX: found `SCNT, 8` declared in the DSDT immediately after
+    SBFR - an 8-bit field NEVER read anywhere in the entire DSDT (Apple's
+    own code never trims either, hence the garbling always being latent).
+    Verified empirically (live configfs + acpi_call test, zero reboot
+    risk): read ManufacturerName via SBRB, then read SCNT right after -
+    got back exactly 3, matching "SMP"'s real 3-character length. This
+    confirmed SCNT is genuinely the real byte-count of the last SMBus
+    block-read transaction - a real, hardware-reported length, not a
+    guess.
+    Fixed _BIX to read SCNT after each block-read command (0x20/0x21/0x22)
+    and slice the buffer to exactly that many bytes via Mid() before
+    ToString() - no hardcoding, no null-guessing, genuine live data
+    trimmed to its real reported length.
+    CONFIRMED WORKING after reboot: model_name=bq20z451,
+    manufacturer=SMP - completely clean, matching macOS exactly, zero
+    garbage. This closes out the ENTIRE battery _BIX thread with nothing
+    left approximated: cycle count, both capacities, firmware serial, AND
+    model/vendor strings are all now genuinely correct, live-read values.
+    Only the rich pack serial (macOS's "C01514309YEF90MA4", a proprietary
+    Apple format) remains unavailable - confirmed it does NOT live at
+    ManufacturerData (0x23, which is actually just the manufacture date,
+    "2020-12-06", verified via the same live-test technique) - it's some
+    other, unidentified command/protocol, not worth further blind
+    guessing.
+
+    Diagnostic tooling used along the way (acpi_call-dkms, for reading
+    ACPI method return values live without a reboot) was installed and
+    removed multiple times as needed - fully cleaned up each time, not
+    left installed. Note for next time: the plain `acpi_call` package
+    pulls in the vanilla `linux` kernel as a dependency (wrong kernel
+    flavor for this system) - always use `acpi_call-dkms` instead, which
+    builds against whatever kernel is actually running.
+
+    Files: /etc/initcpio/acpi_override/batbix.aml (compiled SSDT),
+    /etc/mkinitcpio.conf.d/20-acpi-override.conf (HOOKS+=(acpi_override)).
+    The `linux-cachyos-safe` fallback Limine entry (clean initramfs, no
+    override) built during the panic-recovery process was kept as an
+    extra safety margin for a while, then REMOVED on 2026-09-13 once the
+    acpi_override mechanism was fully validated: deleted the
+    /boot/<machine-id>/linux-cachyos-safe/ kernel directory (limine-entry-tool
+    auto-discovers kernel-ids from directories under /boot/<machine-id>/,
+    so removing the directory is the actual removal step), ran
+    `limine-update`, then hand-removed the now-stale top-level
+    `//linux-cachyos-safe` block from /boot/limine.conf directly (the
+    tool adds/updates entries for directories it finds but does not prune
+    entries for directories that disappeared) and fixed `default_entry`
+    accordingly. A backup of the prior limine.conf was kept at
+    /boot/limine.conf.bak-safe-removal. Historical Snapshots sub-menu
+    entries referencing `linux-cachyos-safe` via preserved
+    `limine_history/initramfs-safe_sha256_*` files were left alone; those are managed by limine-snapper-sync's own snapshot lifecycle and
+    age out naturally as old snapshots are pruned.
+
+    FINAL COMPARISON vs macOS ground truth - everything reachable matches:
+      Cycle Count:            299         = 299
+      Design Capacity:        4800 mAh    = 4800 mAh
+      Full Charge Capacity:   4058 mAh    = 4058 mAh
+      FirmwareSerialNumber:   100         = 100
+      DeviceName/model:       bq20z451    = bq20z451
+      Manufacturer:           SMP         = SMP
+      ManufacturerData (a date, "2020-12-06") - no Linux equivalent
+      Rich pack Serial ("C01514309YEF90MA4") - no Linux equivalent
+
+    Why those last two have NO Linux equivalent (structural, not a gap in
+    the fix): ACPI _BIX's 20-field data model has NO manufacture-date
+    field anywhere in the spec - there's nowhere in
+    /sys/class/power_supply/BAT0/ for one to exist at all. The rich
+    Serial string is different: _BIX DOES have a SerialNumber slot, and
+    it's already correctly filled (100) - but that field is spec'd as a
+    plain 16-bit integer, so it structurally cannot hold a string like
+    "C01514309YEF90MA4" regardless of what we do. macOS has extra,
+    Apple-private fields with no standard-ACPI home to put them in on
+    Linux - a macOS-side richness gap, not something left unfixed here.
+
+    Post-session cleanup verified complete: no stray acpi_call/
+    acpi_call-dkms/linux packages, no loaded acpi_call or acpi_configfs
+    modules, no leftover configfs table entries, no scratch .asl/.aml/
+    .dsl files left on either /tmp or this Backups drive, boot entries
+    exactly the expected three (linux-cachyos, linux-cachyos-safe,
+    linux-cachyos-lts), only pre-existing unrelated qt5-base orphan
+    remains (not from this session, not touched).
+
+    A condensed, redo-on-fresh-install version of this entire file
+    (final config only, no investigation narrative) is saved at
+    /mnt/backups/CACHYOS_FRESH_INSTALL_GUIDE.txt
