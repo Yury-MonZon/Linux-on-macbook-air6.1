@@ -673,6 +673,8 @@ Do §16 first if you also want the battery-info fields this section doesn't cove
 
 **Because §10 uses real deep S3 sleep:** the EC/SMBus genuinely loses power during a real S3 cycle (unlike `s2idle`, where it never does), and a read landing during its post-resume settle window can occasionally return garbage. The shipped module already guards against this (a sanity ceiling on the charge registers rejects anything implausible and keeps the last known-good value instead), but if you ever see `upower` briefly report an absurd `energy-full` right after a real S3 resume, it should self-correct within one poll cycle (10s); `sudo systemctl restart upower.service` clears a stale cached value immediately if it doesn't.
 
+**Battery temperature** is exposed as `/sys/class/power_supply/BAT0/temp` (and so shows up in `upower` as `temperature:`). It is read from SBS register `0x08` over SMBus, i.e. straight from the battery pack's own controller, so it does not depend on Apple's undocumented SMC key names. Implausible values are rejected rather than published, and the property returns `-ENODATA` until a valid reading exists instead of reporting a fake `0`. As a sanity check it tracks `applesmc`'s `TB0T` within about 0.2C and moves with it.
+
 **Charging status near 100%:** this pack's firmware doesn't always flip its own completion bits promptly, and can keep delivering a real, slowly-tapering top-balance trickle current for many minutes after `charge_now` already equals `charge_full`. The module reports `Full` as soon as the charge registers themselves say 100%, rather than waiting on the EC's own (sometimes late) completion signal, so `upower`/`status` won't sit on `Charging` for the whole trickle tail.
 
 ---

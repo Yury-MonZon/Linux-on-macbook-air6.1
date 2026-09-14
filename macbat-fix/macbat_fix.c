@@ -39,6 +39,8 @@ struct macbat_data {
 	u32 charge_full_uah;
 	u32 charge_full_design_uah;
 	u32 cycle_count;
+	int temp_dc;
+	bool temp_valid;
 	char model[32];
 	char manufacturer[32];
 	char serial[16];
@@ -175,6 +177,21 @@ static void macbat_update(struct macbat_data *d)
 	if (!read_word(0x17, &raw))
 		d->cycle_count = raw;
 
+	/* SBS Temperature(), reg 0x08, unsigned tenths of a Kelvin. The
+	 * power_supply API wants tenths of a degree Celsius. Reject values
+	 * outside a plausible pack range (-40C to +100C) rather than
+	 * publishing a garbage reading, same policy as the charge registers
+	 * above: a real S3 cycle cuts EC/SMBus power and a read landing in
+	 * the settle window can return nonsense. */
+	if (!read_word(0x08, &raw)) {
+		int dc = (int)raw - 2731;
+
+		if (dc >= -400 && dc <= 1000) {
+			d->temp_dc = dc;
+			d->temp_valid = true;
+		}
+	}
+
 	read_string(0x21, d->model, sizeof(d->model));
 	read_string(0x20, d->manufacturer, sizeof(d->manufacturer));
 
@@ -228,6 +245,7 @@ static enum power_supply_property macbat_props[] = {
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
@@ -257,6 +275,11 @@ static int macbat_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
+		break;
+	case POWER_SUPPLY_PROP_TEMP:
+		if (!d->temp_valid)
+			return -ENODATA;
+		val->intval = d->temp_dc;
 		break;
 	case POWER_SUPPLY_PROP_CYCLE_COUNT:
 		val->intval = d->cycle_count;

@@ -2393,3 +2393,90 @@ Resume config was pre-flighted and is correct: btrfs inspect-internal
 map-swapfile -r /swap/swapfile returns 6104320, exactly matching
 resume_offset on the kernel command line (note filefrag reports a different
 address space on btrfs and must not be used for this).
+
+ITEM 43: RESUME TIME IS DOMINATED BY CPU BRING-UP, NOT FIRMWARE. A WORKAROUND
+THAT HUNG THE MACHINE, AND A DISPROVEN FIX, 2026-09-14 session
+
+MEASUREMENT CAVEAT, READ THIS FIRST: do NOT measure suspend/resume timing with
+journalctl. It backfills wall-clock timestamps across the suspend boundary and
+bunches the whole resume sequence into a few milliseconds, which completely
+hides the problem below. Earlier in this same session that led to a confident
+and WRONG conclusion that kernel resume took only 134-460ms and that the
+remaining delay was invisible firmware time. Use `dmesg` monotonic timestamps.
+
+REAL FINDING (via the Linux Mint thread at
+https://forums.linuxmint.com/viewtopic.php?t=456323, which describes the same
+problem on MacBook Pros): most of the resume time is the kernel bringing the
+secondary CPU cores back online. Measured with dmesg monotonic timestamps:
+
+  [ 6671.041930] Enabling non-boot CPUs ...
+  [ 6671.418984] CPU1 is up            377 ms
+  [ 6671.426156] CPU2 is up              6 ms
+  [ 6673.968548] CPU3 is up           2533 ms
+  [ 6674.883561] PM: suspend exit    total 3.85 s
+
+Other samples ranged from 30 us to 16.9 s for a single core. It is extremely
+erratic between otherwise identical resumes.
+
+WORKAROUND TRIED AND IT HUNG THE MACHINE, DO NOT REPEAT: the thread's fix is a
+systemd-sleep hook that offlines the secondary cores before suspend and
+re-onlines them after. It worked, and worked well, for exactly one cycle:
+kernel resume dropped from 3.85 s to 1.56 s, with the Enabling non-boot CPUs /
+CPUx is up lines gone entirely, and re-onlining afterwards cost only ~64 ms for
+all three cores (~30 ms each) because normal hotplug is fast. Then the very
+next suspend hung the machine hard, requiring a power reset:
+
+  21:26:30.325174  smpboot: CPU 1 is now offline
+  21:26:30.356861  smpboot: CPU 2 is now offline
+  21:26:30.383816  smpboot: CPU 3 is now offline
+  <nothing ever logged again; never reached PM: suspend entry>
+
+The hook is preserved at /root/cpu-offline.disabled for reference but must not
+be reinstalled in that form. Offlining CPUs from a sleep hook races with the
+suspend path. A 2.3 s saving is not worth hard resets on a btrfs root that may
+also be carrying a hibernation image.
+
+tsc=reliable TESTED AND DISPROVEN: hypothesis was that TSC synchronization at
+CPU bring-up was the slow part (the firmware clobbers TSC_ADJUST across S3,
+logged every resume as "[Firmware Bug]: TSC ADJUST differs ... Restoring").
+Evidence against it was gathered before testing (no TSC warp warnings anywhere
+in dmesg; live offline/online of a core while awake takes only 38-42 ms, so
+generic hotplug is fast), and the test confirmed it did not help. Three resumes
+with tsc=reliable measured 10.67 s, 8.44 s and 7.09 s total, all worse than any
+sample taken without it. Reverted from /etc/default/limine.
+
+LIKELY ACTUAL CAUSE, hardware level and not tunable from Linux: the per-CPU
+pattern is consistent across every sample. CPU2 is always fast (3-7 ms) while
+CPU1 and CPU3 are always slow. This machine's i5-4250U is 2 physical cores with
+4 threads, and the boot log APIC IDs (CPU1 = APIC 0x2, CPU2 = APIC 0x1,
+CPU3 = APIC 0x3) show CPU2 is CPU0's sibling hyperthread on the SAME physical
+core, which is already powered and therefore instant. CPU1 and CPU3 sit on the
+second physical core, which has to be physically powered back up after S3. The
+delay is the package restoring that core, which is silicon/firmware power
+sequencing, not a kernel cost. This is consistent with the erraticism.
+
+ITEM 44: macbat_fix: BATTERY TEMPERATURE ADDED, 2026-09-14 session
+
+Prompted by noticing the mbp-2016-linux project exposes battery temperature.
+/sys/class/power_supply/BAT0/temp did not exist, because the module never read
+it. Added POWER_SUPPLY_PROP_TEMP, reading SBS Temperature() at register 0x08
+(unsigned tenths of a Kelvin) and converting to the tenths-of-a-degree-Celsius
+the power_supply API expects. Implausible values (outside -40C to +100C) are
+rejected rather than published, matching the existing policy for the charge
+registers, since a real S3 cycle cuts EC/SMBus power and a read landing in the
+settle window can return nonsense. When no valid reading has been taken the
+property returns -ENODATA rather than a fabricated zero.
+
+The value is authoritative by construction: it comes from the battery pack's
+own controller over SMBus, not from any SMC sensor, so it does not depend on
+Apple's undocumented SMC key naming.
+
+As a supporting cross-check, applesmc's TB0T and TBXT track it closely and,
+more convincingly, move WITH it: the module read 38.4 C when TB0T read 38.0 C,
+and later 40.4 C when TB0T read 40.2 C. Tracking within 0.2 C across a real
+2 degree change is much better evidence than a single coincidental match.
+TB1T (29 C) and TB2T (33 C) read lower and are presumably different locations.
+The CPU sensors (TC*) sit in a clearly separate 47-55 C band, so the value is
+definitely not a CPU reading. Note that "TB = Temperature Battery" is Apple SMC
+community convention, not documented by Apple, which is exactly why the SBS
+register rather than the SMC key is the basis for this property.
