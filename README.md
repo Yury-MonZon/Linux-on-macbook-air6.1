@@ -215,17 +215,28 @@ Fully disables the DSL3510 Thunderbolt controller (~2W savings vs. partial-savin
 ## 10. Suspend/wake: final working config (do not deviate from this)
 
 ```bash
-sudo sed -i -E 's/^#?MemorySleepMode=.*/MemorySleepMode=s2idle/' /etc/systemd/sleep.conf
-sudo sed -i -E 's/^#?HibernateDelaySec=.*/HibernateDelaySec=15min/' /etc/systemd/sleep.conf
+sudo mkdir -p /etc/systemd/sleep.conf.d /etc/systemd/logind.conf.d
 
-sudo sed -i -E 's/^#?HandleLidSwitch=.*/HandleLidSwitch=suspend-then-hibernate/' /etc/systemd/logind.conf
+# real deep S3 (suspend-to-RAM), not s2idle: measured ~0.06W standby draw
+# (weeks of standby) vs the 1-3W typical of s2idle on this Haswell hardware
+sudo tee /etc/systemd/sleep.conf.d/50-deep-s3.conf > /dev/null << 'EOF'
+[Sleep]
+MemorySleepMode=deep
+EOF
+
+# lid closes with hybrid-sleep: hibernation image written up front, THEN
+# suspend to RAM. Deliberately not suspend-then-hibernate, see below.
+sudo tee /etc/systemd/logind.conf.d/50-lid-hybrid-sleep.conf > /dev/null << 'EOF'
+[Login]
+HandleLidSwitch=hybrid-sleep
+HandleLidSwitchExternalPower=hybrid-sleep
+EOF
 ```
 
 Kernel cmdline additions go in **`/etc/default/limine` `KERNEL_CMDLINE`, not `/etc/kernel/cmdline`** (this system's `limine-entry-tool` ignores that file once `KERNEL_CMDLINE[default]` is set; run `sudo limine-update` after any cmdline edit to rebuild both initramfs images + `limine.conf`):
 
 ```bash
 for param in \
-  'rtc_cmos.use_acpi_alarm=1' \
   'acpi_sleep=nonvs' \
   'button.lid_init_state=open' \
   'i915.enable_dc=0 i915.enable_fbc=0 i915.enable_psr=0' \
@@ -236,7 +247,7 @@ done
 sudo limine-update
 ```
 
-(`rtc_cmos.use_acpi_alarm=1` is THE critical fix, see below.)
+**`rtc_cmos.use_acpi_alarm=1` deliberately is NOT in that list, and earlier versions of this guide were wrong to call it "THE critical fix".** It is a no-op on this hardware: the kernel force-enables it anyway via a DMI quirk (`drivers/rtc/rtc-cmos.c`, `use_acpi_alarm_quirks()`: Intel plus `dmi_get_bios_year() >= 2015` sets it unconditionally), and that runs during probe, after module-parameter parsing, so the command line can never change it either way. This Mac reports a 2022 BIOS date (Apple firmware 474.0.0.0.0 on 2013 hardware), so it trips the quirk. Verified by removing the parameter, rebooting, and observing `/sys/module/rtc_cmos/parameters/use_acpi_alarm` still reading `Y`. Setting it changes nothing; whatever fixed the old suspend-retrigger loop was one of the other changes here.
 
 ```bash
 # disable ACPI wake from S3 on XHC1 (USB/Bluetooth controller):
@@ -250,38 +261,109 @@ sudo udevadm control --reload-rules
 
 (side effect: Bluetooth peripherals can no longer wake the machine from suspend, not normally missed on a laptop)
 
+**Both hooks below must go in `/usr/lib/systemd/system-sleep/`, not `/etc/systemd/system-sleep/`.** The `/etc/` path looks plausible (systemd usually supports an `/etc/` override alongside `/usr/lib/`) but `systemd-sleep` only ever scans `/usr/lib/systemd/system-sleep/` for this specific hook mechanism -- confirmed by direct instrumentation after both hooks turned out to have been silently inert for the entire life of this project when placed in `/etc/`. If you already have these in `/etc/systemd/system-sleep/` from an earlier version of this guide, move them, don't copy: `sudo mv /etc/systemd/system-sleep/* /usr/lib/systemd/system-sleep/` (the facetimehd hibernate-freeze fix and this d3cold fix were never actually running until moved).
+
 ```bash
-sudo tee /etc/systemd/system-sleep/facetimehd > /dev/null << 'EOF'
+sudo tee /usr/lib/systemd/system-sleep/facetimehd > /dev/null << 'EOF'
 #!/bin/bash
-case $1 in
-  pre)  modprobe -r facetimehd 2>/dev/null ;;
-  post) modprobe facetimehd 2>/dev/null ;;
+case "$2" in
+  hibernate|hybrid-sleep)
+    case "$1" in
+      pre)  modprobe -r facetimehd 2>/dev/null ;;
+      post) modprobe facetimehd 2>/dev/null ;;
+    esac
+    ;;
 esac
 EOF
-sudo chmod +x /etc/systemd/system-sleep/facetimehd
+sudo chmod +x /usr/lib/systemd/system-sleep/facetimehd
 ```
 
-(unloads/reloads the camera driver around every sleep transition: the driver failing to cleanly re-suspend right after its own fragile s2idle-resume firmware reinit was the root cause of a genuine kernel freeze at hibernation-entry, requiring a hard cold boot to recover)
+(unloads/reloads the camera driver around hibernate transitions only: the driver failing to cleanly re-suspend right after its own fragile s2idle-resume firmware reinit was the root cause of a genuine kernel freeze at hibernation-entry, requiring a hard cold boot to recover. Scoped to `$2` = hibernate/hybrid-sleep only, not plain suspend: the camera's own ISP firmware reload can stall for several real seconds on `post`, and that cost has no reason to be paid on an ordinary lid-open S3 resume where the freeze bug doesn't occur. Do NOT also match `suspend-then-hibernate` here even though it sounds hibernate-adjacent: if your `HandleLidSwitch` is set to `suspend-then-hibernate`, systemd passes that exact string as `$2` on every lid-close, including ones that stay a plain few-second S3 sleep and never reach real hibernation, confirmed live by kernel log showing "PM: suspend entry (deep)"/"PM: suspend exit" (not hibernation) on a cycle that still triggered the reload before this was caught and fixed.)
 
 ```bash
-sudo tee /etc/systemd/system-sleep/disable-d3cold > /dev/null << 'EOF'
-#!/bin/sh
-echo 0 > /sys/bus/pci/devices/*/d3cold_allowed 2>/dev/null || true
+sudo tee /usr/lib/systemd/system-sleep/disable-d3cold > /dev/null << 'EOF'
+#!/bin/bash
+case $1 in
+  pre)
+    find /sys/devices/ -name d3cold_allowed -exec sh -c 'echo 0 > "$1" 2>/dev/null' _ {} \;
+    ;;
+esac
 EOF
-sudo chmod +x /etc/systemd/system-sleep/disable-d3cold
+sudo chmod +x /usr/lib/systemd/system-sleep/disable-d3cold
 ```
 
 ```bash
 systemctl disable NetworkManager-wait-online.service   # minor boot-time win
 ```
 
-**Why this exact config:** the root cause of the old "intermittent suspend-then-hibernate" problem was an RTC wakealarm handshake bug between systemd-sleep and the `rtc_cmos` driver: it would self-retrigger every ~102 seconds (sometimes 18+ times in a row) instead of waiting out `HibernateDelaySec`, before eventually settling into a real hibernate. `rtc_cmos.use_acpi_alarm=1` makes the `rtc_cmos` driver arm/read the wake alarm through ACPI-mediated methods instead of raw legacy CMOS register pokes, letting firmware stay in the loop for the whole handshake. This fixed it, validated across many full lid-close→suspend→hibernate→resume cycles with zero retrigger-loop recurrences. XHC1 disable, `nonvs`, `button.lid_init_state=open`, and the i915 power-saving disables are separate, complementary fixes for other quirks found the same session (see `cachyos_patches_applied.txt` for the full research trail and citations). The facetimehd hook fixes a *different*, unrelated genuine kernel freeze (not the retrigger loop).
+**Why hybrid-sleep and not `suspend-then-hibernate`:** this is the single least obvious decision in the whole guide, and it is forced by a firmware limitation that took a lot of measuring to pin down.
 
-**Do NOT set `MemorySleepMode=deep`.** Tested directly: kernel-level suspend/resume completes cleanly, but the screen does not wake on lid-open, requiring a power-button press to restore the display. This is the documented black-screen-on-resume symptom for real S3 on Mac hardware, not folklore.
+`suspend-then-hibernate` works by suspending to RAM, arming an RTC wake alarm for `HibernateDelaySec`, waking itself at that deadline, and only then writing the hibernation image. **This machine's firmware will not honor an RTC alarm wake while the lid is shut and the system is in real S3.** The wake that is supposed to trigger the "should I hibernate now?" check never fires, so the machine simply stays suspended forever and only hibernates when you open the lid yourself. Proven with a controlled four-way test (a small program arming a `CLOCK_BOOTTIME_ALARM` timerfd across a suspend, plus a `systemd-inhibit handle-lid-switch` lock so logind could not interfere):
 
-**Known, long-standing, unfixed limitation** (not touched by any of the above, don't chase it as a new bug): opening the lid does **not** wake this machine from s2idle suspend. The lid event genuinely is received at the ACPI level, but under s2idle the kernel only treats an SCI as a real wake if it came from a GPE armed specifically for wake, and this one isn't, so the event is processed without ending the s2idle loop. Enabling EC/LID0/SPIT in `/proc/acpi/wakeup` does not change this. **The actual workflow: open the lid, then tap a key.** The keyboard wakes it fine (goes via xHCI, a real armed wake source). Waking from a genuinely *completed* hibernate (not just suspend) always requires the power button on this hardware too. This is also long-standing and also not fixable here (neither RTC nor the lid switch has a valid S4/power-on wake path, only S3).
+| sleep mode | lid | RTC alarm wakes it? |
+|---|---|---|
+| s2idle | closed | yes |
+| deep S3 | open | yes |
+| deep S3 | **closed** | **no** (slept through a 75 second alarm for 3.5 minutes) |
+
+systemd is blameless here: with debug logging on it correctly logs `Set timerfd wake alarm for 59s` and the machine just sleeps through it.
+
+`hybrid-sleep` sidesteps the problem entirely because **it has no timer at all**. It writes the hibernation image up front, then suspends to RAM, and stays there until woken. Confirmed in systemd's source: only `suspend-then-hibernate` goes through the timerfd loop (`execute_s2h()`), while `hybrid-sleep` calls `execute()` directly. The image is pure insurance: discarded on a normal wake, used only if power is actually lost. That means `HibernateDelaySec` is irrelevant under this config.
+
+This is also, as it turns out, exactly what macOS does on this hardware. Its own power-management logs show `hibmode=3 standbydelaylow=10800`, i.e. it writes the image at sleep time and keeps RAM powered, and every wake in those logs is `EC.LidOpen` or HID activity, with not a single RTC or timer wake. macOS never needs the capability this firmware lacks. (The one thing macOS additionally does, and Linux cannot, is have the SMC cut RAM power after the standby delay. Boot Camp was checked too and ships no SMC or power driver at all, so there is no non-Darwin mechanism to borrow.)
+
+**`MemorySleepMode=deep` is correct here, and earlier versions of this guide were wrong to forbid it.** The old objection was that the screen would not wake on lid-open. That is a real s2idle limitation (see below), not an S3 one. Under deep S3 the lid genuinely does wake the machine. Deep S3 was measured at roughly **0.06W** standby draw (about 4mAh over a 31 minute measured sleep, i.e. weeks of standby), versus the 1-3W typical of s2idle on Haswell-era hardware. Its one real cost is that firmware platform resume takes a few seconds before Linux regains control at all, which is invisible to every OS-side measurement and not fixable from Linux (§10a removes 2 seconds of it).
+
+**Wake sources, and why they differ by sleep mode** (this trips people up, so it is worth stating precisely):
+
+- **Under deep S3 (this config): opening the lid wakes the machine.** This is the normal workflow and it works.
+- **Under s2idle: opening the lid does NOT wake it.** The lid event genuinely is received at the ACPI level, but under s2idle the kernel only treats an SCI as a real wake if it came from a GPE armed specifically for wake, and this one is not, so the event is processed without ending the s2idle loop. Enabling EC/LID0/SPIT in `/proc/acpi/wakeup` does not change it. The workaround there is to open the lid and then tap a key.
+- **Keyboard wake needs the whole USB chain enabled, not just `XHC1`.** If you ever want it, note that the internal keyboard is USB device `1-5` hanging off `0000:00:14.0`, and enabling `XHC1` in `/proc/acpi/wakeup` alone is not enough: the **root hub** `usb1` also has to have `power/wakeup` enabled or the remote-wake signal cannot propagate up the chain. That was verified live (keyboard wake stayed dead with `XHC1` enabled, and started working the moment the root hub was enabled too). This guide leaves `XHC1` disabled on purpose (spurious-wake source, see the udev rule above), and under deep S3 the lid alone is sufficient.
+- Waking from a genuinely *completed* hibernate (not just suspend) always requires the power button on this hardware. Not fixable here: neither the RTC nor the lid switch has a valid S4/power-on wake path, only S3.
 
 Separately, the physical lid switch itself sometimes sends genuine spurious Lid-closed/Lid-opened ACPI events at short (30-90s) intervals with no user interaction; root cause not identified (hinge/sensor wear vs. firmware quirk). Currently just tolerated as-is.
+
+---
+
+## 10a. Cutting 2 seconds off every S3 resume (`DTLK` SSDT override)
+
+Apple's firmware runs a Thunderbolt shutdown sequence on every resume from S3, and for non-Darwin operating systems it contains a blind **`Sleep(2000)`**, i.e. a full 2 seconds of doing nothing, on the critical resume path. Measured precisely with ftrace on `acpi_ps_execute_method()`: **2051ms before the fix, 164ms after.**
+
+The method lives in `SSDT5` (OEM ID `APPLE `, table ID `PcieTbt`) and is called from `_WAK` only when `!OSDW() && Arg0 == 0x03`, i.e. S3 wake on a non-Darwin OS. Real macOS never executes it at all, which is why Apple never had to care about the delay.
+
+```bash
+# decompile the table as shipped by your own firmware
+mkdir -p ~/ssdt-dtlk && cd ~/ssdt-dtlk
+sudo cat /sys/firmware/acpi/tables/SSDT5 > SSDT5.aml
+iasl -d SSDT5.aml
+```
+
+Make exactly two edits to `SSDT5.dsl`:
+
+1. Bump the OEM revision in the `DefinitionBlock` header so the kernel accepts it as a replacement (an override only wins if its revision is strictly higher):
+   `0x00001000` becomes `0x00001001`
+2. Inside `Method (DTLK, 0, Serialized)`, change `Sleep (0x07D0)` (2000ms) to `Sleep (0x64)` (100ms).
+
+100ms rather than removing the sleep outright is deliberate: `RP05` (the Thunderbolt root port) is already disabled the whole time we are asleep under this guide's config, so there is no live link transition to wait on, but a small settle margin costs nothing.
+
+```bash
+iasl -tc SSDT5.dsl                      # expect 0 errors, 0 warnings
+sudo mkdir -p /etc/initcpio/acpi_override
+sudo cp SSDT5.aml /etc/initcpio/acpi_override/ssdt5-dtlk-fix.aml
+```
+
+Add `acpi_override` to `HOOKS` in `/etc/mkinitcpio.conf` if it is not already there, then **before rebooting, build a clean fallback image with no overrides** so a bad table cannot leave you unbootable:
+
+```bash
+sudo mkinitcpio -k "$(uname -r)" -g /boot/initramfs-linux-cachyos-safe.img -S acpi_override
+sudo limine-update
+lsinitcpio /boot/initramfs-linux-cachyos.img | grep -i acpi   # should list the override
+lsinitcpio /boot/initramfs-linux-cachyos-safe.img | grep -ci acpi   # should be 0
+```
+
+Confirm after reboot with `sudo journalctl -k -b | grep PcieTbt`, which should show `Table Upgrade: override [SSDT-APPLE - PcieTbt]`.
+
+**Honest scope note:** this genuinely removes ~1.9 seconds of firmware stall, verified by direct measurement, but it does **not** make resume feel instant. Most of the remaining delay is firmware platform resume that happens before Linux regains control at all, and is invisible to every OS-side instrument. For reference, macOS logs its own wake times on this machine at 0.33 to 0.60 seconds, but those are wakes from its "Deep Idle" state, not from S3, so it is not a like-for-like comparison.
 
 ---
 
@@ -348,6 +430,18 @@ sudo systemctl restart tlp.service
 ```
 
 Deliberately did NOT add: `DISK_APM_LEVEL_*`/`SATA_LINKPWR_*` (pure NVMe machine, these are SATA-only no-ops), aggressive `PCIE_ASPM_*`/`RUNTIME_PM_ON_BAT=auto` (risks destabilizing the wifi/camera drivers).
+
+`powertop --html` will list further "Bad" tunables beyond what TLP covers; most of its generic advice actively conflicts with the tuning already done above (e.g. it wants `intel_pstate/min_perf_pct` raised to 50%, undoing the frequency caps in §14) and should not be applied blindly. The one genuinely safe, no-downside item is runtime PM for the Intel HECI (Management Engine) PCI device, applied via udev so it survives reboots:
+
+```bash
+sudo tee /etc/udev/rules.d/99-heci-runtime-pm.rules > /dev/null << 'EOF'
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", ATTR{device}=="0x9c3a", ATTR{power/control}="auto"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --subsystem-match=pci
+```
+
+Left alone: USB autosuspend for the internal keyboard/trackpad and xHCI controller runtime PM both touch the same hardware already tuned for wake-source reliability in §10, real regression risk for negligible power gain.
 
 ---
 
@@ -440,7 +534,7 @@ Apple's DSDT only implements the older ACPI `_BIF` battery method (no cycle-coun
 
    sudo mkdir -p /etc/initcpio/acpi_override
    cat > /tmp/battery-bix-fix.asl << 'ASLEOF'
-   DefinitionBlock ("", "SSDT", 2, "LOCAL", "BATBIX", 0x00000001)
+   DefinitionBlock ("", "SSDT", 2, "LOCAL", "BATBIX", 0x00000002)
    {
        External (\_SB.BAT0, DeviceObj)
        External (\_SB.PCI0.LPCB.EC.SMB0.SBRW, MethodObj)
@@ -464,6 +558,8 @@ Apple's DSDT only implements the older ACPI `_BIF` battery method (no cycle-coun
            \_SB.BAT0.PBIX [0x03] = Local0
            \_SB.PCI0.LPCB.EC.SMB0.SBRW (0x0B, 0x19, RefOf (Local0))
            \_SB.BAT0.PBIX [0x05] = Local0
+           \_SB.PCI0.LPCB.EC.SMB0.SBRW (0x0B, 0x01, RefOf (Local0))
+           \_SB.BAT0.PBIX [0x06] = Local0
            \_SB.PCI0.LPCB.EC.SMB0.SBRW (0x0B, 0x17, RefOf (Local0))
            \_SB.BAT0.PBIX [0x08] = Local0
            \_SB.PCI0.LPCB.EC.SMB0.SBRW (0x0B, 0x1C, RefOf (Local0))
@@ -516,6 +612,67 @@ Apple's DSDT only implements the older ACPI `_BIF` battery method (no cycle-coun
 - The block-read string fields (ManufacturerName `0x20`/DeviceName `0x21`/DeviceChemistry `0x22` via `SBRB`) return a fixed 32-byte EC buffer (`SBFR`, declared 256 bits in the DSDT): only the first *N* bytes are real, the rest is non-null leftover buffer content with a null only at the very end, so `ToString()` alone does not trim it. The real fix: `SCNT` (an 8-bit field right after `SBFR` in the DSDT, declared but never read anywhere in Apple's own code) holds the real byte count of the last block-read transaction; read it right after each `SBRB` call and slice with `Mid()` before `ToString()`. No hardcoding needed or wanted.
 - Do NOT deliver this via a second Limine boot module (a hand-built early cpio + `initrd=` in `KERNEL_CMDLINE`): this caused a real kernel panic requiring manual recovery. The mkinitcpio `acpi_override` hook above is the correct, safe, already-proven mechanism (same one microcode already uses every boot); use it, not a custom one.
 - Real cycle count, design capacity, and full capacity all confirmed matching macOS's own IOKit data exactly (verified via `ioreg -l -w0 -r -c AppleSmartBattery` on the macOS side, if dual-booting). The one thing not achievable: macOS's rich proprietary `Serial` string has no equivalent anywhere in the ACPI `_BIX` data model; only the small numeric `SerialNumber` (`FirmwareSerialNumber` in macOS) is reachable.
+- `_BIX` field index 6 (Design Capacity of Warning) is filled from a genuine EC-reported threshold too: SBS command `0x01` (RemainingCapacityAlarm) returns the fuel gauge's real factory alarm level (300 mAh on this unit), not a guessed value. In practice nothing on this kernel surfaces it as a distinct sysfs file (`capacity_alert_min`/`max` don't exist in `drivers/acpi/battery.c` for ACPI batteries at all), so treat this as "correct or genuine data if anyone ever reads it," not as a feature that visibly does anything today.
 
 ---
 
+## 17. Real-time battery current/power and live percentage (kernel module, no DSDT patch)
+
+This fixes two remaining bugs that `_BIX` (§16) doesn't touch: reported power draw showing impossible values (70-100W on a 15W-TDP chip), and battery percentage getting stuck at 100% no matter how much it actually discharges. Both come from Apple's real `_BST` method (Battery Status, the one polled continuously for live state), not from anything `_BIX` covers.
+
+**Root cause:** `_BIF`/`_BIX` declare a `Power Unit` field telling the kernel whether to expose this battery as mA-based (`current_now`/`charge_now`) or mW-based (`power_now`/`energy_now`). In `_BIF` that field is index 0; in `_BIX` a new `Revision` field shifts it to index 1. Apple's stock `_BIF` uses `0` (mW-based, matching their own crude `x10` mAh-to-mWh approximation used throughout their firmware). Our own `_BIX` from §16 deliberately uses `1` (mA-based) instead, to report clean, exact mAh values matching macOS rather than Apple's approximation. That's the right call, but it silently broke consistency with `_BST`, which was never updated to match: Apple's real `UBST` method still computes `current(mA) * voltage(mV) / 1000` (a genuine mW value) into the field the kernel now reads as current, and still multiplies `RemainingCapacity` by `10` the same way `_BIF`'s capacity fields used to be scaled. Confirmed this wasn't always broken: checking `upower`'s own historical rate log from before `_BIX` was ever installed shows sane 9-13W readings under plain stock `_BIF`.
+
+**The approach:** an earlier version of this fix patched the real DSDT directly (replacing `_BST`'s logic the same way `_BIX` was added in §16), and that DSDT patch genuinely worked, verified over hours of real use. But `_BST` already exists in the firmware DSDT, so fixing it that way means replacing the *entire* table rather than adding a small overlay, a meaningfully bigger blast radius than any other fix in this guide. The approach below avoids that entirely: a small kernel module reads the underlying hardware registers directly (bypassing `_BST`/`_BIX` altogether) and replaces the kernel's stock battery driver for this one device. **The real DSDT stays 100% stock and unmodified** with this approach; only one small additive SSDT is used, in the same safe, proven, already-established category as `_BIX`.
+
+Do §16 first if you also want the battery-info fields this section doesn't cover (nothing here strictly requires it, since the module below reads hardware directly and duplicates everything `_BIX` provides anyway, but §16 alone is a smaller, more conservative change if you don't need live current/power/percentage).
+
+1. `_BST`'s real implementation returns its results by writing through a `RefOf()` reference argument, a mechanism that only works from inside another ACPI method's own scope, not from an external kernel module calling in. So the module needs one tiny helper method with a plain integer return value instead: `\_SB.MBRD(type, reg)`. `type=0` proxies `SBRW` (word reads: current, voltage, capacities, cycle count), `type=1` proxies `SBRB` (block/string reads: model, manufacturer). It's loaded as a small additive SSDT (a new method name, never existed before, so no `AE_ALREADY_EXISTS` risk, no table replacement). Source and the kernel module's C source both live in this repo's [`macbat-fix/`](macbat-fix/) directory rather than inline here, since the module is a few hundred lines:
+
+   ```bash
+   git clone https://github.com/Yury-MonZon/Linux-on-macbook-air6.1.git /tmp/macbat-fix-src
+   cd /tmp/macbat-fix-src/macbat-fix
+   iasl -tc mbread.asl
+   sudo mkdir -p /etc/initcpio/acpi_override
+   sudo cp mbread.aml /etc/initcpio/acpi_override/mbread.aml
+   ```
+
+   If you also did §16, remove `batbix.aml` from the same directory and any DSDT-replacement `.aml` from an earlier attempt; this module supersedes both entirely.
+
+2. Package the module (`macbat-fix/macbat_fix.c`, `Makefile`, `dkms.conf` in the cloned repo) as DKMS, matching the pattern of the other out-of-tree modules in this guide (`facetimehd`, `broadcom-wl`), so it survives kernel updates and rebuilds automatically for every installed kernel:
+
+   ```bash
+   sudo mkdir -p /usr/src/macbat-fix-1.0
+   sudo cp macbat_fix.c Makefile dkms.conf /usr/src/macbat-fix-1.0/
+   sudo dkms add -m macbat-fix -v 1.0
+   for k in $(ls /usr/lib/modules/ | grep cachyos); do
+     sudo dkms install -m macbat-fix -v 1.0 -k "$k"
+   done
+   ```
+
+3. Auto-load at boot and load it now:
+
+   ```bash
+   echo macbat_fix | sudo tee /etc/modules-load.d/macbat_fix.conf
+   sudo limine-update
+   sudo modprobe macbat_fix
+   ```
+
+4. Verify:
+
+   ```bash
+   sudo dmesg | grep macbat_fix
+   for f in status capacity charge_now charge_full current_now voltage_now cycle_count model_name; do
+     printf "%-15s %s\n" "$f:" "$(cat /sys/class/power_supply/BAT0/$f)"
+   done
+   upower -i $(upower -e | grep BAT) | grep -E "energy-rate|percentage"
+   ```
+
+   Expect `unbinding stock driver 'acpi-battery' from BAT0` followed by `loaded, corrected battery reporting active`, real mAh values matching §16's numbers, a plausible `energy-rate` (single digits to ~20W range, not 70-100W), and `capacity`/`charge_now` that actually move over a few minutes of real charge/discharge instead of staying frozen.
+
+**Reversible at any time:** `sudo rmmod macbat_fix` cleanly hands the device back to the stock driver (confirmed: `acpi-battery` automatically reclaims it, no gap in battery reporting, no reboot needed). The real DSDT was never touched, so there is no fallback-boot-entry scenario to worry about here the way there would be for a table patch.
+
+**Because §10 uses real deep S3 sleep:** the EC/SMBus genuinely loses power during a real S3 cycle (unlike `s2idle`, where it never does), and a read landing during its post-resume settle window can occasionally return garbage. The shipped module already guards against this (a sanity ceiling on the charge registers rejects anything implausible and keeps the last known-good value instead), but if you ever see `upower` briefly report an absurd `energy-full` right after a real S3 resume, it should self-correct within one poll cycle (10s); `sudo systemctl restart upower.service` clears a stale cached value immediately if it doesn't.
+
+**Charging status near 100%:** this pack's firmware doesn't always flip its own completion bits promptly, and can keep delivering a real, slowly-tapering top-balance trickle current for many minutes after `charge_now` already equals `charge_full`. The module reports `Full` as soon as the charge registers themselves say 100%, rather than waiting on the EC's own (sometimes late) completion signal, so `upower`/`status` won't sit on `Charging` for the whole trickle tail.
+
+---

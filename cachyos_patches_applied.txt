@@ -1386,3 +1386,1010 @@ CPU: Intel Core i7-4650U @ 1.70GHz (Haswell-ULT), 2C/4T, max 3.3GHz.
     A condensed, redo-on-fresh-install version of this entire file
     (final config only, no investigation narrative) is saved at
     /mnt/backups/CACHYOS_FRESH_INSTALL_GUIDE.txt
+
+29. REAL-TIME BATTERY DATA FIX (_BST: current/power mislabeling + frozen
+    100% percentage), 2026-09-14 session, full DSDT patch (extends item 28)
+
+    Two bugs found after item 28 shipped, both in _BST (Battery Status,
+    polled continuously for live state) rather than _BIX (item 28, static
+    fields only): upower/GNOME reporting 70-100W power draw on a 15W-TDP
+    chip (physically impossible; the machine's own real ceiling under
+    full load is ~22-23W, established in item 23), and battery percentage
+    permanently stuck at 100% with charge_now pinned exactly equal to
+    charge_full no matter how long it actually discharged.
+
+    ROOT CAUSE, confirmed via reading the real DSDT source and a raw SBS
+    register read (acpi_call, same technique as item 28's SCNT discovery):
+    _BIF/_BIX declare a "Power Unit" byte telling Linux whether to expose
+    this battery as mA-based (current_now/charge_now) or mW-based
+    (power_now/energy_now). In _BIF that byte is index 0; _BIX inserts a
+    new Revision field at index 0, shifting Power Unit to index 1. Apple's
+    real _BIF uses value 0 there (mW-based, consistent with their own
+    crude x10 mAh-to-mWh approximation that item 28 had to remove for
+    _BIX's capacity fields to show real numbers matching macOS). Our own
+    item-28 _BIX deliberately used value 1 (mA-based) instead, to get
+    clean exact mAh values -- the right call, but it silently broke
+    consistency with _BST, which was never touched: Apple's real UBST
+    method still computes current(mA) * voltage(mV) / 1000 (a genuine
+    mW value) into the field now read as current, and still multiplies
+    RemainingCapacity by 10 the same way _BIF's old capacity fields were
+    scaled.
+
+    Confirmed this was NOT a pre-existing Apple firmware bug (macOS never
+    exercises _BST/_BIF/_BIX at all -- it uses its own private
+    AppleSmartBattery/SMC/IOKit path, so this code is a compatibility
+    shim only ever exercised by non-macOS OSes; that's also why _BIF
+    never got a working cycle-count field in the first place). Checked
+    upower's own historical rate log (/var/lib/upower/history-rate-*.dat)
+    from 2026-09-11, two days before item 28's _BIX was ever installed:
+    genuine 9-13W readings under plain stock _BIF. The mislabeling is a
+    real, direct side effect of item 28's own Power Unit choice, not
+    something Apple shipped broken.
+
+    THE FIX: _BST already exists in the real DSDT (unlike _BIX, which was
+    a new addition), so it can't be patched via an additive SSDT the way
+    item 28 was -- tried exactly that first, got AE_ALREADY_EXISTS, same
+    as any attempt to redefine an existing namespace object via configfs
+    dynamic table loading. Required replacing the entire DSDT table
+    instead, a meaningfully bigger blast radius than an additive SSDT.
+
+    Before touching anything: rebuilt the linux-cachyos-safe fallback
+    boot entry (deleted a few hours earlier this same session once it
+    seemed unneeded) using `mkinitcpio -S acpi_override` to build a
+    genuinely clean initramfs with zero ACPI overrides. Caught a real
+    mistake in this step: the first manual limine.conf entry used SHA256
+    checksums, but this system's ENABLE_VERIFICATION=yes actually checks
+    BLAKE2b-512 (`b2sum -l 512`) -- would have made the fallback fail to
+    boot exactly when it was needed. Fixed and reverified against the
+    real files before proceeding.
+
+    Decompiled the live DSDT, edited exactly two lines inside UBST:
+    removed the `* voltage` from the current calculation (now stores the
+    raw signed current directly, matching mA-based convention) and
+    removed the `* 10` from RemainingCapacity (now matches item 28's
+    un-scaled real-mAh capacity fields). Recompiled with OEM revision
+    bumped 0x00060001 -> 0x00060002 (same rule as item 28's discovery:
+    revision must be strictly greater for the kernel to treat a
+    same-signature table as a genuine override, not a silently-ignored
+    duplicate). Installed as a second .aml alongside batbix.aml in the
+    same acpi_override hook directory; both load from the same mechanism.
+
+    VERIFIED after reboot: `ACPI: Table Upgrade: override
+    [DSDT-APPLE -MacBookA]`, revision 00060002 confirmed active. Battery
+    percentage now moves normally over real time (watched it tick
+    77.5% -> 76.4% -> ... -> 33% over several hours of actual use,
+    charge_now decrementing second-to-second, e.g. 1325000 -> 1322000uAh
+    across an 8-second sample). energy-rate now reads plausible values
+    (9-16W range observed at idle and under light `glxgears` load,
+    correctly proportional -- CPU temp rose 49C -> 65C under load,
+    draw rose ~14W -> ~16W, both sane). No regression to item 28's fixes:
+    cycle_count still live and correct (299 -> 300, incremented
+    naturally), model_name/manufacturer/serial_number/charge_full_design
+    all unchanged and correct. Zero new ACPI errors in dmesg/journal.
+
+    Also added, same DSDT edit: _BIX field index 6 (Design Capacity of
+    Warning) now reads the real EC alarm threshold via SBS command 0x01
+    (RemainingCapacityAlarm) -- genuine factory value, 300 mAh on this
+    unit (confirmed via the same raw acpi_call technique). Traced where
+    this should surface in sysfs by fetching the actual upstream
+    drivers/acpi/battery.c source: capacity_alert_min/max don't exist in
+    this driver at all for ACPI batteries (a wrong assumption on my part,
+    corrected once checked against real source rather than guessed); the
+    `alarm` file is the real mechanism (seeded from design_capacity_warning
+    once, only if still zero at that point in init) but still reads 0
+    after the fix, root cause not fully traced (low value: GNOME's actual
+    low-battery warning uses its own separate percentage logic, not this
+    kernel mechanism). Left the real value in the field regardless since
+    it's genuine EC data, not a placeholder -- matches the same
+    no-hardcoding principle as item 28's SCNT/serial work.
+
+    Also surveyed the rest of the real DSDT for other unused-but-working
+    capabilities while in there: found the ambient light sensor (ALS0,
+    ACPI0008, real EC-backed _ALI/_ALR data) is fully functional at the
+    kernel level (acpi_als bound, live IIO device) but GNOME's
+    ambient-enabled auto-brightness setting is off -- a deliberate user
+    choice, not a bug, left as-is. Nothing else in the table flagged as
+    broken; rest is routine PCI-bridge/i915-output-port/button-device
+    plumbing already handled correctly by existing drivers.
+
+30. REAL-TIME BATTERY DATA FIX: REVISED FROM FULL DSDT PATCH TO A DKMS
+    KERNEL MODULE, ZERO DSDT MODIFICATION (supersedes item 29's approach,
+    same underlying bugs and root cause), 2026-09-14 session
+
+    Item 29's full-DSDT-table-replacement fix worked, verified correct
+    over hours of real use (percentage ticking down normally, plausible
+    energy-rate, no regressions). But it meant replacing the entire DSDT
+    rather than adding a small overlay, a meaningfully bigger blast
+    radius than every other fix in this project, all of which are
+    additive SSDTs. Explicitly did not like that: "I dont like the idea
+    of rewriting whole dsdt, possible to do with smaller overlay?"
+
+    Explored a cheaper alternative first: reverting _BIX's Power Unit
+    byte back to Apple's stock mW-based convention (value 0) instead of
+    item 28's mA-based choice (value 1), which would let _BST's existing
+    math work unmodified. Rejected: that convention pairs with Apple's
+    crude x10 mAh-to-mWh approximation throughout the firmware, which
+    would inflate absolute Wh and time-remaining estimates by a fixed,
+    exact ~32% versus the real mAh numbers item 28 established against
+    macOS. "min remaining must be precise, thats important." Also
+    checked for CONFIG_ACPI_CUSTOM_METHOD (raw AML injection via
+    /sys/kernel/debug/acpi/custom_method) as a live, non-persistent
+    alternative to a table replacement; confirmed removed from mainline
+    Linux years ago (security liability), not present in this kernel's
+    config.
+
+    THE FIX ACTUALLY SHIPPED: "maybe custom dkms module can solve that?"
+    -- a small out-of-tree kernel module (macbat_fix.ko) that unbinds the
+    stock acpi-battery driver from BAT0 and reads the underlying SBS/EC
+    registers directly, bypassing _BST and _BIX entirely. The real DSDT
+    is never modified.
+
+    Obstacle: _BST's real UBST method returns its results by writing
+    through a RefOf() output-reference argument, a mechanism that only
+    resolves inside another ACPI method's own execution scope. There is
+    no supported kernel API to construct a live Reference from external
+    C code calling in via acpi_evaluate_object(). Fix: one tiny wrapper
+    method with a plain integer return value, \_SB.MBRD(type, reg),
+    loaded as a small additive SSDT (mbread.aml, a brand-new method name
+    that never existed before, so no AE_ALREADY_EXISTS risk, no table
+    replacement needed). type=0 proxies SBRW (word reads: current,
+    voltage, capacities, cycle count), type=1 proxies SBRB (block/string
+    reads: model, manufacturer).
+
+    Build toolchain: this kernel is built with clang 22.1.8; plain gcc
+    failed on clang-specific flags (-mstack-alignment=8 etc). Fixed with
+    `make LLVM=1`.
+
+    Two real bugs caught and fixed during development, not just
+    warnings:
+    - insmod failed, -EEXIST ("Device or resource busy"), power_supply
+      registration returned -17. Root cause: the real acpi-battery
+      driver binds at the platform-bus level
+      (/sys/devices/platform/PNP0C0A:00), not on the raw acpi_device
+      itself, which was the wrong thing being checked/unbound. Fixed by
+      using bus_find_device_by_name(&platform_bus_type, NULL,
+      "PNP0C0A:00") to find and release the correct device.
+    - acpi_dev_install_notify_handler() takes 4 args, not 3 (needs a
+      void *context), and the acpi_notify_handler callback signature is
+      void (*)(acpi_handle, u32, void *context), not
+      void (*)(struct acpi_device *, u32) as first assumed. Fixed both.
+    - On rmmod, BAT0 vanished entirely from
+      /sys/class/power_supply/ instead of the stock driver reclaiming
+      it. Fixed by explicitly calling device_attach(pdev) in the
+      module's exit path; verified working (ACPI: battery: Slot [BAT0]
+      (battery present) reappears immediately, correct data, no reboot
+      needed).
+    - __power_supply_register warned "Expected proper parent device"
+      even though the module still worked. Fixed by passing the found
+      platform device as the real parent instead of NULL.
+
+    Packaged as DKMS (same pattern as facetimehd/broadcom-wl elsewhere
+    in this project): source at /usr/src/macbat-fix-1.0/, dkms add +
+    dkms install per installed kernel, auto-load via
+    /etc/modules-load.d/macbat_fix.conf.
+
+    "remove the DSDT patch and batbix, keep just the module": deleted
+    both dsdt-battery-fix.aml (item 29's full table replacement) and
+    batbix.aml (item 28's additive SSDT) from
+    /etc/initcpio/acpi_override/, rebuilt the initramfs, and confirmed
+    via a full cold reboot that the real DSDT is now 100% stock again:
+    `ACPI: DSDT ... 0x00060001` (original Apple revision, no override
+    message at all). Only mbread.aml remains as an ACPI override, a
+    single small additive SSDT exposing nothing but the raw register
+    proxy the module needs.
+
+    VERIFIED after reboot and repeated live insmod/rmmod cycles: dmesg
+    shows "unbinding stock driver 'acpi-battery' from BAT0" followed by
+    "loaded, corrected battery reporting active"; real mAh values
+    matching item 28's numbers; energy-rate in the plausible single-digit
+    to ~20W range (not 70-100W); charge_now and capacity genuinely
+    tracking over time rather than frozen, cross-checked twice against
+    upower's own output at explicit request ("check it" / "check
+    again"), both times consistent. Also confirmed the kernel's "OE"
+    taint: O (out-of-tree) is correct and expected for macbat_fix; E
+    (unsigned-module) is a kernel-wide sticky flag for the whole boot
+    session inherited from an unrelated acpi_call signature-verification
+    race earlier at boot, not a reflection of macbat_fix's own state
+    (which is validly signed, confirmed via modinfo, PKCS#7/DKMS
+    sha512 signature present and correct).
+
+31. macbat_fix MODULE: THREE FOLLOW-UP BUGS FOUND AND FIXED (design
+    voltage missing, wrong charge-status bit, this specific fuel gauge's
+    real full-charge signal), plus genuine battery-model research,
+    2026-09-14 session (extends item 30)
+
+    Bug 1, ENERGY-FULL-DESIGN FLUCTUATING: noticed upower reporting
+    energy-full-design anywhere from 36.48 Wh to 40.14 Wh depending on
+    when it was checked. Root cause: the module only exposed
+    VOLTAGE_NOW, no design/nominal voltage property, so upower fell back
+    to computing energy = charge(Ah) * voltage_now(V) for the design
+    figure too, making it swing with real-time charging voltage (8.36V
+    while charging) instead of using a fixed nominal value. Read SBS
+    command 0x19 (DesignVoltage, confirmed via raw register dump through
+    the existing \_SB.MBRD proxy: registers 0x08 Temperature, 0x09
+    Voltage, 0x0A Current all cross-checked against live sysfs values
+    first to validate the read path before trusting a new register) =
+    0x1db0 = 7600 mV, i.e. the real 7.6V nominal pack voltage. Added
+    POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN to the module, backed by this
+    register. Verified: energy-full-design now holds a stable, correct
+    36.48 Wh (4.8Ah design capacity x 7.6V) regardless of charge state.
+
+    Along the way, confirmed the real battery model question this was
+    raised to investigate: this machine (A1465 EMC 2631, Early 2014)
+    should carry an Apple A1495 battery (~5100mAh, 38.75Wh, 7.6V, per
+    multiple listings for this exact model/EMC number). The commonly
+    swapped-in lower-capacity compatible part is the A1406 (~4600mAh,
+    35Wh, originally for the Mid-2011 11" Air). This unit's real,
+    hardware-reported design capacity (SBS DesignCapacity, register
+    0x18) is 4800mAh / 36.48Wh at the confirmed 7.6V nominal: about 6%
+    under where a genuine A1495 should sit, and closer to (though not an
+    exact match for) the lower-capacity A1406 range. Not conclusive on
+    its own (online-listed specs vary a few percent batch to batch too),
+    but consistent with a non-original or lower-capacity pack rather
+    than pure cell aging (aging reduces charge_full vs charge_full_design,
+    not the design-capacity register itself, which is fixed at
+    manufacture).
+
+    Bug 2, CHARGE STATUS LOGIC USING THE WRONG BIT: the module's
+    CHARGING vs NOT_CHARGING decision tested BatteryStatus (SBS 0x16)
+    bit 0x40, which is actually the INITIALIZED flag (gauge-ready,
+    normally meaningless for charge state), not a real termination
+    signal, and the module never emitted POWER_SUPPLY_STATUS_FULL at
+    all. Caught while investigating why upower showed
+    percentage: 100% / capacity-level: Full but the kernel's own
+    `status` sysfs file still said Charging with the charger LED
+    already green. Rewrote to check bit 0x10 (FULLY_CHARGED, the
+    correct SBS bit) first for STATUS_FULL, then bit 0x4000
+    (TERMINATE_CHARGE_ALARM) for NOT_CHARGING, falling back to CHARGING.
+
+    Bug 3, THIS SPECIFIC bq20z451 FIRMWARE NEVER SETS FULLY_CHARGED:
+    after the bit-2 fix, watched the real transition live (a 20-second
+    poll loop backgrounded on purpose rather than guessing a timeline)
+    as current_now tapered 620mA -> 502mA -> 418mA -> plateaued near
+    294mA for a bit -> resumed tapering to 267mA -> reached a genuine
+    0mA. At that exact point charge_now equaled charge_full (100%) and
+    the charger LED was already green, but BatteryStatus still read
+    0xc0e0: FULLY_CHARGED (bit 0x10) was NOT set, but OVER_CHARGED_ALARM
+    (bit 0x8000) and TERMINATE_CHARGE_ALARM (bit 0x4000) both were, and
+    stayed that way. This particular gauge firmware evidently signals a
+    completed charge through OVER_CHARGED_ALARM instead of the standard
+    FULLY_CHARGED bit -- confirmed by direct correlation (current
+    genuinely 0mA, charge_now == charge_full, both alarms set
+    simultaneously), not assumed from the SBS spec alone. Added
+    OVER_CHARGED_ALARM as an equivalent trigger for STATUS_FULL.
+    Rebuilt, reinstalled via DKMS for both kernels, reloaded live:
+    kernel status file flipped from Not charging to Full at the exact
+    moment the fixed module was reloaded, timestamped by the same
+    background poll (11:23:56), immediately after five prior samples at
+    0mA current still showing Not charging under the old logic --
+    direct before/after proof the fix, not the battery, was what
+    changed.
+
+    All three fixes verified with zero interruption to live battery
+    reporting (rmmod/modprobe cycles each time, same as item 30's
+    established reversibility) and rebuilt/reinstalled for both
+    installed kernels (7.2.4-3-cachyos, 6.18.50-2-cachyos-lts), matching
+    the DKMS convention used throughout this project.
+
+32. POWERTOP "BAD" TUNABLES: SURVEYED, MOSTLY REJECTED AS WRONG FOR THIS
+    MACHINE, ONE APPLIED (HECI RUNTIME PM), 2026-09-14 session
+
+    Ran `powertop --html` fresh rather than trusting an old cached list.
+    11 items came back under Software Settings in Need of Tuning.
+    Checked each against this machine's actual current config instead of
+    applying blindly, since several of powertop's generic recommendations
+    turned out to conflict with tuning already deliberately in place
+    elsewhere in this project.
+
+    REJECTED, conflicts with existing intentional config:
+    - Intel P-state min_perf_pct -> 50%: currently 24% (TLP-managed).
+      Forcing a 50% floor would stop the CPU idling below half its max
+      frequency, working directly against the frequency-cap and thermal
+      work in items 20-22. TLP would likely reset it on the next AC/
+      battery profile switch anyway.
+    - Energy performance bias -> balance-performance: current EPB value
+      is 8 (leans power-save); "balance-performance" is a lower value
+      (~4, leans performance). Applying it would move toward MORE power
+      use, backwards from the "ops-per-watt over raw runtime" choice
+      already stated for this machine's frequency caps.
+    - VM dirty_ratio -> 50: this system already uses vm.dirty_bytes
+      (256MB, a conservative absolute cap), not the ratio mechanism;
+      dirty_ratio reads 0 as a result. Setting dirty_ratio would activate
+      the ratio and zero out dirty_bytes, ballooning the unwritten-data
+      window to 50% of RAM. Given this project's real history of hangs
+      during hibernate/resume work (items 13, 18, 23-25), a larger
+      in-memory dirty buffer is the wrong direction for data-loss risk
+      on an unclean shutdown.
+    - default_qdisc -> fq: current is fq_codel already, the modern
+      lower-latency default. powertop's suggestion here is generic/dated
+      advice, not an actual improvement.
+    - Autogroup scheduling -> 0: negligible measured power effect,
+      real (if small) desktop-interactivity downside. Not worth it.
+
+    DEFERRED, touches hardware with real suspend/wake history:
+    - USB autosuspend for the Apple Internal Keyboard/Trackpad: currently
+      "on" (always powered). Apple's internal keyboard/trackpad has
+      known Linux autosuspend wake-lag quirks, and this is the primary
+      input device. Given item 19's suspend/wake config is explicitly
+      "do not deviate from this," left this for deliberate isolated
+      testing rather than bundling it in.
+    - xHCI PCI runtime PM (0000:00:14.0): same physical controller the
+      keyboard/trackpad and Bluetooth hang off (confirmed via
+      `lsusb -t`), and the one already surgically tuned for wake-source
+      reliability (XHC1 ACPI wake disabled, item 25). Runtime PM
+      (active-state power management) is a different mechanism than
+      ACPI wake configuration, but it is the same hardware that has
+      already caused real problems in this project. Left alone.
+    - KSM sleep_millisecs -> 4000: moot, KSM is off (run=0) on this
+      system, so this tunable currently has no effect either way.
+
+    APPLIED, genuinely safe:
+    - Runtime PM for PCI Device Intel 8 Series HECI #0 (0000:00:16.0,
+      8086:9c3a, mei_me driver): Intel Management Engine interface,
+      a standard TLP-default tunable elsewhere with no known downside.
+      Set live (`power/control` -> auto) and confirmed it actually drops
+      into a suspended runtime power state, not just the control knob.
+      Made persistent via a udev rule matching this project's existing
+      pattern (same style as 99-hid-apple-fix.rules from item 4), keyed
+      on PCI vendor:device ID so it survives any PCI address renumbering:
+
+        /etc/udev/rules.d/99-heci-runtime-pm.rules:
+        ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x8086", \
+          ATTR{device}=="0x9c3a", ATTR{power/control}="auto"
+
+      Verified idempotent on a manual `udevadm trigger --action=add`.
+
+    Left cursor-blink (fbcon, TTY-only, irrelevant under GNOME/Wayland)
+    and khugepaged scan_sleep_millisecs unapplied at explicit request,
+    even though both were assessed as low-risk; only the HECI item was
+    asked for.
+
+33. LID-REOPEN-DURING-SUSPEND HANG: ROOT CAUSED AND FIXED (systemd
+    freeze-step race), plus two dead-end investigations along the way
+    (lid-open ACPI wake, a broken debounce attempt), 2026-09-14 session.
+    STATUS: fix applied and passing repeated real tests, but NOT YET
+    CLEARED FOR THE PUBLIC README -- only a few hours of testing so far,
+    keeping it here until it has proven itself over real daily use.
+
+    STARTING POINT: revisited the long-standing "lid can't wake the
+    machine, needs a key tap" limitation (README's own stated known
+    quirk) at user's request, hoping a custom driver could do better
+    than the /proc/acpi/wakeup toggles already tried and rejected in
+    item 19.
+
+    DEAD END 1, LID-OPEN ACPI WAKE: decompiled the live DSDT and found
+    LID0, EC, and ADP1 (AC adapter) all share the same wake GPE (0x70),
+    and all declare it valid starting at S3 (0x03) or S4 (0x04) in
+    their _PRW, never S0. Under s2idle, Linux only arms a GPE for wake
+    if _PRW declares it valid down to S0, so this GPE can never be
+    armed no matter what /proc/acpi/wakeup says. Verified GPE 0x70 stays
+    at a 0 count through idle EC traffic, AC unplug/replug, and lid
+    cycles (runtime-enabled for observation only, not wake-armed) --
+    genuinely quiet, not a noisy shared line. Built a small experimental
+    kernel module (lid_wake_fix.ko, never installed via DKMS, manually
+    insmod/rmmod only) that calls the raw acpi_set_gpe_wake_mask()
+    ACPICA function to force-arm GPE 0x70 for wake, bypassing the
+    Linux ACPI bus layer's S-state gate entirely. It loaded fine and the
+    mask genuinely engaged, but a real test (close lid, open without a
+    key tap) still didn't wake the machine, and gpe70's counter stayed
+    at 0 throughout -- the lid switch itself doesn't appear to
+    electrically assert this GPE, so even a correctly-forced software
+    mask can't fix what may be a hardware-level non-connection. Fully
+    reverted (rmmod, mask disabled, gpe70 back to disabled); confirmed
+    via a full reboot that no trace remained (EC back to its natural
+    default *disabled, matching pre-session state).
+
+    Also checked SPIT (Apple SPI keyboard/trackpad, APP000D)'s own _PRW
+    while investigating the "key tap should wake it" behavior
+    documented as working in item 19/25: it has the exact same S3-only
+    limitation (_PRW returns {0x1C, 0x03} unconditionally, never S0),
+    and its GPE (0x1C) also never fires (checked via
+    /sys/firmware/acpi/interrupts/gpe1C). Its Linux-level
+    power/wakeup=enabled flag on the ACPI companion platform node looks
+    like ACPI's generic default for any device with a _PRW, not
+    evidence of an actually-working path, and no driver is even bound
+    at that exact platform node (applespi attaches elsewhere in the
+    stack). Could not find or confirm a genuinely working non-ACPI wake
+    path for the keyboard either. Net result: today, only the power
+    button reliably wakes this machine from s2idle; lid-open and
+    key-tap wake are both ACPI dead ends under s2idle specifically.
+    Whether key-tap wake genuinely worked reliably before today, via
+    some mechanism not yet identified, or whether item 19/25's
+    validation was based on limited/lucky testing, is unresolved.
+
+    DEAD END 2, LID-DEBOUNCE SERVICE (caused a WORSE hang than the
+    original bug): while investigating, closing the lid and reopening
+    it within a few seconds was found to sometimes hang the whole
+    machine (first occurrence: kernel resumed fine but the display
+    never came back, needed the power key; second occurrence: totally
+    unresponsive, power key did nothing either, required a forced
+    power-off; confirmed via journalctl -b -1 after reboot that the
+    forced-off boot really had happened, and that this was NOT related
+    to any of the lid-wake experimentation above, since it reproduced
+    identically on a freshly rebooted, fully clean baseline).
+
+    Attempted a fix: a systemd service permanently holding a
+    `handle-lid-switch` inhibitor (mode=block, the only mode the CLI
+    supports for this category, confirmed by testing -- mode=delay is
+    rejected with "Delay inhibitors only supported for shutdown and
+    sleep") wrapping a polling script that debounces lid state itself
+    and manually calls `systemctl suspend-then-hibernate` once the lid
+    has been closed for 2s straight. This made things WORSE: the
+    debounce only checked lid state once before firing, so a reopen
+    immediately after the trigger (but before the kernel actually
+    finished suspending) recreated the identical race, just delayed by
+    2s. Worse, every subsequent lid close fired ANOTHER
+    suspend-then-hibernate call even while the first was still stuck
+    ("Action suspend-then-hibernate already in progress, refusing"),
+    and this pile-up of overlapping calls appears to have caused real
+    D-Bus/systemd job contention -- systemd-sleep eventually logged
+    `Failed to freeze unit 'user.slice': Connection timed out`, and the
+    whole system degraded into total unresponsiveness (keyboard, power
+    button, and even SSH/network all inert; no wired ethernet exists on
+    this machine, and wlan0 gets torn down as a normal early step of
+    suspend-prep, which is consistent with "no ssh worked" without
+    requiring a full kernel-level hang to explain it). Required a
+    forced power-off. Immediately stopped and disabled the service,
+    deleted the script and unit file, confirmed via
+    `systemd-inhibit --list` that no inhibitor remained held. BTRFS
+    came through clean both times (`btrfs device stats` all zero,
+    scrub found no errors) -- no data loss from either forced power-off.
+
+    ROOT CAUSE (found via the crashed boot's full journal, not the
+    kernel log alone): a lid reopen a few seconds after close can race
+    systemd-sleep's freeze-user-sessions step (the step that pauses all
+    user-slice processes before the kernel actually suspends, meant as
+    a safety net, not something required for suspend to function).
+    When that freeze gets stuck, the entire sleep transaction hangs
+    indefinitely with no kernel-level suspend ever logged, and logind
+    stops acting on the power key while a sleep operation is "in
+    flight." This matches real, independently-documented upstream
+    systemd bug reports (systemd/systemd#33795 "Frozen user.slice +
+    child processes after resuming from suspend to RAM", #38468
+    "user.slice freeze failure causes system suspend issues") -- this
+    looks like a genuine, somewhat common systemd/cgroup-freezer class
+    of bug, not something unique to this machine's ACPI setup, that
+    happens to get triggered here by a fast lid flip.
+
+    THE ACTUAL FIX: systemd-sleep supports a documented escape hatch,
+    the SYSTEMD_SLEEP_FREEZE_USER_SESSIONS environment variable
+    (confirmed present in this exact binary via `strings
+    /usr/lib/systemd/systemd-sleep`), which skips the freeze step
+    entirely when set to 0. Applied via drop-in overrides (matching
+    this project's established .service.d/.conf.d pattern) on all three
+    relevant units:
+
+        /etc/systemd/system/systemd-suspend-then-hibernate.service.d/override.conf
+        /etc/systemd/system/systemd-suspend.service.d/override.conf
+        /etc/systemd/system/systemd-hibernate.service.d/override.conf
+
+        [Service]
+        Environment=SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=0
+
+    Confirmed `systemd-suspend-then-hibernate.service` and
+    `systemd-suspend.service` both exec the same `/usr/lib/systemd/
+    systemd-sleep` binary directly (no chained sub-service), so the
+    override reaches the actual freeze step. daemon-reload only, no
+    reboot needed.
+
+    VERIFIED with four separate real tests after applying, all in the
+    same boot (no forced reset needed for any of them), each confirmed
+    via journalctl:
+    - Normal close/wait/open: clean suspend entry/exit, needed power
+      key to actually wake (the separate, already-documented lid/key
+      wake limitation above, not a hang).
+    - Fast flip (~1s): `PM: suspend entry` still fires (logind still
+      dispatches the queued action regardless of current lid state by
+      the time it runs), but completes cleanly in 5s instead of hanging.
+      Journal shows "User sessions remain unfrozen on explicit request"
+      confirming the override engaged.
+    - Very fast flip: same clean result; keyboard backlight didn't have
+      time to visibly dim given the ~2s round trip, a cosmetic artifact
+      of the short duration, not a bug.
+    - Another longer close/open: also clean.
+
+    Left as debug state, not yet reverted: HibernateDelaySec=30s
+    (/etc/systemd/sleep.conf.d/99-debug-hibernate-delay.conf, from
+    earlier resume-hang debugging this same session) and a live
+    drm.debug=0x11F verbose logging level (doesn't survive reboot,
+    harmless, no longer actually needed since the real cause turned out
+    to be systemd-level, not DRM-level).
+
+34. macbat_fix: TRANSIENT GARBAGE CHARGE READING AFTER REAL S3 RESUME,
+    FOUND AND FIXED, 2026-09-14 session (extends item 31, found during
+    item 33's deep S3 testing)
+
+    While testing real deep S3 (item 33), noticed via `upower -d` a
+    wildly wrong reading: energy-full: 498.066 Wh (should be ~30.8 Wh),
+    percentage: 3.87% while capacity (health) correctly still showed
+    100%/84.5%. Raw sysfs charge_full had already self-corrected to the
+    right value (4054000, matching normal) by the time it was checked,
+    confirming this was a genuine but transient bad read, not a
+    persistent corruption -- the module's own 10s poll cycle overwrote
+    it with a good value on its own. But upower itself stayed stuck on
+    the bad cached value even after the underlying sysfs data was
+    correct again, so the user-visible battery indicator remained wrong
+    until upower was manually restarted.
+
+    ROOT CAUSE: unlike s2idle (where the EC/SMBus never loses power),
+    a real S3 resume actually power-cycles the EC, and the module's SBS
+    register reads (via the \_SB.MBRD wrapper from item 30) have no
+    sanity checking at all -- a read landing during the EC/SMBus's
+    post-resume settle window can return garbage, and that garbage was
+    being written straight into charge_full_uah/charge_now_uah with no
+    validation, corrupting every downstream calculation (percentage,
+    health, time-to-full) until the next poll cycle happened to read
+    correctly. This is a real bug in the module's own read path, not
+    something s2idle testing could ever have surfaced (explains why it
+    was never caught until today's item 33 deep S3 testing).
+
+    FIX: added a sanity ceiling (SANE_CHARGE_MAH_MAX = 10000, more than
+    2x this pack's 4800mAh design capacity, comfortably above anything
+    a real reading could ever be but well below the kind of garbage a
+    bad SMBus transaction produces) to the charge_now/charge_full/
+    charge_full_design reads in macbat_update(). A read exceeding this
+    ceiling is discarded and the previous known-good value is kept
+    instead of overwriting it with garbage. Rebuilt and reinstalled via
+    DKMS for both kernels, reloaded live with no gap in reporting;
+    restarted upower.service once to clear its stuck cached bad value
+    (confirmed correct afterward: energy-full back to 30.81 Wh,
+    percentage 63%, matching raw sysfs capacity).
+
+    This is a real, evidence-based fix to a real bug the module already
+    had, found only because item 33 exercised a real S3 EC power-cycle
+    for the first time since macbat_fix was built. Worth remembering:
+    any future real-S3 work should re-check battery reporting
+    specifically, since s2idle testing alone cannot catch this class of
+    EC-settle-timing bug.
+
+35. SYSTEMD-SLEEP HOOKS: WRONG DIRECTORY, SILENTLY INERT FOR THE ENTIRE
+    PROJECT, FOUND AND FIXED, 2026-09-14 session (found while chasing
+    S3 wake speed, item 33; retroactively affects items 23 and 31)
+
+    While building a new sleep hook (short-sleep-no-lock, see below) to
+    debounce GNOME's instant lock-on-suspend, added dependency-free
+    debug instrumentation when the hook never fired. Confirmed via
+    direct file-based logging (bypassing logger/journald entirely) that
+    it genuinely was not being invoked at all during a real suspend
+    cycle, despite being correctly placed, executable, and functioning
+    perfectly when run manually.
+
+    ROOT CAUSE: `man systemd-sleep` states clearly that these hooks are
+    read from `/usr/lib/systemd/system-sleep/` only. This project's
+    facetimehd hibernate-freeze fix (item 23) and the disable-d3cold
+    NVMe stability fix (item 12/19-era) had both been installed to
+    `/etc/systemd/system-sleep/` instead -- a directory that LOOKS
+    plausible (most other systemd hook/unit directories genuinely do
+    support an /etc/ override merged with /usr/lib/), but this specific
+    mechanism does not. Confirmed via `ls /usr/lib/systemd/system-sleep/`
+    that only `tlp`'s own hook (installed by the tlp package itself) was
+    ever actually present in the real directory; facetimehd and
+    disable-d3cold were sitting in a directory systemd-sleep never
+    reads. The "Found FaceTime HD camera..." driver re-probe message
+    seen on every resume, which was taken as evidence the hook was
+    working, is just the driver's own normal PCI resume() callback
+    doing a full hardware reinit -- present identically whether or not
+    the module was ever actually removed and reloaded, so it was never
+    real evidence either way.
+
+    This means the facetimehd hibernate-freeze fix and the d3cold NVMe
+    fix have most likely been silently non-functional for the entire
+    life of this project, including throughout all of today's session's
+    testing (every "hook is working" assumption made earlier today, and
+    likely long before, was wrong).
+
+    FIX: moved both to the correct directory:
+        sudo mv /etc/systemd/system-sleep/facetimehd /usr/lib/systemd/system-sleep/facetimehd
+        sudo mv /etc/systemd/system-sleep/disable-d3cold /usr/lib/systemd/system-sleep/disable-d3cold
+    (and removed the now-empty /etc/systemd/system-sleep/ directory)
+
+    VERIFIED genuinely active for the first time, via the same
+    dependency-free instrumentation technique:
+    - disable-d3cold: confirmed it set 16 real devices' d3cold_allowed
+      to 0 before a real suspend (previously this was never happening
+      at all).
+    - facetimehd: confirmed a real `modprobe -r facetimehd` (exit 0)
+      on "pre" and a real `modprobe facetimehd` (exit 0) on "post",
+      genuine module removal and reload, not just the driver's own
+      resume() callback.
+    - Ran a full real hibernate cycle (`systemctl hibernate`, real
+      power-off, manual power-button resume) with the fix genuinely
+      active for the first time: hibernation entry -> hibernation exit
+      completed cleanly with no freeze, matching the original item 23
+      bug scenario, now actually verified rather than assumed.
+
+    Also fixed the README's own copies of these two hooks (public
+    guide was telling readers to install to the same wrong /etc/ path,
+    meaning every reader following this guide has been getting inert
+    fixes too), and found a second, independent bug while doing so: the
+    README's disable-d3cold example used a shell glob
+    (`echo 0 > /sys/bus/pci/devices/*/d3cold_allowed`) instead of the
+    actual deployed, verified-working `find /sys/devices/ -name
+    d3cold_allowed -exec ...` version -- the glob form only covers
+    direct PCI children (missing nested devices the recursive find
+    catches) and would likely throw an "ambiguous redirect" shell error
+    outright once the glob expands to more than one match. Fixed both
+    issues in the README in the same edit.
+
+36. GNOME LOCK-ON-SUSPEND DEBOUNCE: ATTEMPTED, CAUSED A REAL REGRESSION,
+    REVERTED, 2026-09-14 session
+
+    Continuing the S3 wake-speed investigation (item 33's DTLK fix), a
+    real ~2.5+ second silent gap was found in the full userspace journal
+    (checked every unit, not just gdm/keyring-specific ones) between
+    kernel-level resume completing and the GDM greeter's
+    "gkr-pam: unlocked login keyring" event -- user confirmed nothing
+    was visible/interactive on screen during that gap (not password-
+    entry time, genuinely unresponsive). Root cause: GNOME's
+    gsd-screensaver locks the session unconditionally on every suspend
+    (org.gnome.desktop.screensaver lock-enabled=true, no suspend-
+    specific delay setting exists in this GNOME version), forcing a
+    full GDM greeter rebuild + keyring unlock + re-authentication flow
+    on every single resume, even a 1-second lid flip.
+
+    User chose (given the real security-vs-convenience tradeoff): keep
+    locking, but only if actually asleep past a threshold, not
+    instantly. Implemented as a new /usr/lib/systemd/system-sleep/
+    hook (short-sleep-no-lock): records a pre-suspend timestamp, and on
+    resume, if actual elapsed sleep time was under 300s, immediately
+    calls `loginctl unlock-session` to undo GNOME's automatic lock
+    (kept the automatic lock itself fully intact for genuine long
+    sleeps, avoiding org.gnome.desktop.lockdown disable-lock-screen
+    since that would also block manual/explicit locking, not just the
+    automatic trigger).
+
+    Hit the exact same "wrong directory" bug from item 35 while
+    building this (script silently not invoked from /etc/systemd/
+    system-sleep/ at first); fixed the same way, then confirmed via
+    direct instrumentation it was genuinely computing real elapsed
+    time and calling loginctl correctly.
+
+    REAL REGRESSION FOUND during physical testing: a lid-open ->
+    resume -> our hook unlocks -> the machine suspends AGAIN on its own
+    within under one second, with no new Lid closed event, no user
+    action (explicitly confirmed with the user this wasn't a second
+    physical lid close), and not the HibernateDelaySec/RTC-recheck
+    mechanism from earlier today (already reverted, and only 128s had
+    elapsed against a 15-minute production value regardless). Full
+    sequence logged: PM: suspend exit -> our hook logs a successful
+    unlock -> PM: suspend entry (deep) 857ms later.
+
+    Root cause not fully traced (this is GNOME Shell's own internal JS
+    lock/idle state machine, not something reachable with the
+    ACPI/kernel-level tools used for the rest of today's session).
+    Best-supported theory: `loginctl unlock-session` only updates
+    logind's own tracked LockedHint; it does not know about or
+    coordinate with GNOME Shell's own separate internal lock-screen
+    state, since the unlock did not come from the user entering a
+    correct password into GNOME Shell's own UI. That desync between
+    "logind thinks unlocked" and "GNOME Shell's own internal state"
+    most likely triggered some unintended re-suspend/re-idle reaction
+    inside GNOME Shell's own session logic.
+
+    REVERTED: deleted /usr/lib/systemd/system-sleep/short-sleep-no-lock
+    entirely, confirmed session back to a clean, stable LockedHint=no
+    state with no lingering effects. User decision: keep the original,
+    safe default (instant lock-on-suspend, always) rather than risk
+    this regression recurring. A real delay-based lock debounce would
+    need to work WITH GNOME Shell's own lock/idle state machine (not
+    externally override logind's tracked state around it), which is a
+    genuinely different, riskier class of investigation than anything
+    else in this project and was not pursued further this session.
+
+ITEM 37: FACETIMEHD SLEEP HOOK STALLING EVERY ORDINARY S3 RESUME, FOUND AND FIXED, 2026-09-14 session
+
+SYMPTOM: user reported the screen backlight itself (not GDM, not the lock
+screen) is not instantly on after a real lid-open resume, separate from
+and prior to any userspace session concern. Roughly matches an earlier,
+separately noted "8s from fan bump to screen" observation.
+
+INVESTIGATION: pulled the real kernel journal for the most recent S3
+suspend/resume cycle (suspend entry (deep) 16:36:22.166 -> suspend exit
+16:36:40.257). Kernel-level resume itself is fast and clean: ACPI wake,
+CPU re-enable, EC unblock, i915 vgaarb resume, nvme re-enumeration, all
+complete within the same ~400ms window ending at "PM: suspend exit".
+
+Immediately after that, in the same journal capture, the facetimehd
+sleep hook's "post" modprobe fires and begins a full camera ISP firmware
+reload (visible as FWMSG: lines: PLL lock, DDR calibration, firmware
+load, "ISP woke up after 0ms", then FWMSG firmware banner, then real ISP
+commands CISP_CMD_PRINT_ENABLE / CISP_CMD_CONFIG_GET / CISP_CMD_CH_INFO_GET
+/ CISP_CMD_CH_SET_FILE_LOAD). The log goes silent for the facetimehd
+device immediately after CISP_CMD_CH_SET_FILE_LOAD at 16:36:40.797583 --
+the next kernel line in the whole journal is an unrelated firewall log
+4.8 seconds later, with no further facetimehd/FWMSG output ever
+appearing. The firmware file-load command appears to hang or take
+multiple real seconds on this specific resume.
+
+ROOT CAUSE: the facetimehd hook (item 23, and item 35's directory fix
+which made it actually start running for the first time this session)
+only ever checked $1 (pre/post) in its case statement, never $2 (the
+sleep-transition type systemd-sleep passes: suspend, hibernate,
+hybrid-sleep, suspend-then-hibernate). This meant the camera
+unload/reload -- and its multi-second stall risk -- ran on EVERY sleep
+transition, including plain S3 suspend on ordinary lid-open, even though
+the freeze bug it exists to fix (item 23) only happens on real
+hibernate. Because item 35 this same session moved this hook from an
+inert /etc/ location into the real, active /usr/lib/ location, this
+per-resume stall was a brand new, self-inflicted side effect of that
+very fix -- the hook had never actually been running before, on any
+sleep type, until a few hours earlier in this same session.
+
+FIX: scoped the hook to only run for hibernate-class transitions,
+checking $2:
+    case "$2" in
+      hibernate|suspend-then-hibernate|hybrid-sleep)
+        case "$1" in
+          pre)  modprobe -r facetimehd 2>/dev/null ;;
+          post) modprobe facetimehd 2>/dev/null ;;
+        esac
+        ;;
+    esac
+Deployed live to /usr/lib/systemd/system-sleep/facetimehd and updated
+in README.md's copy of the hook and its accompanying explanation.
+
+STATUS: fix deployed, not yet validated against a real physical test.
+Needs: (1) a real lid-close/lid-open S3 cycle confirming the camera
+reload no longer runs and backlight-on speed improves, (2) a real full
+hibernate cycle confirming the original item-23 freeze fix still holds
+with the scoped hook. Do not consider this item closed until both are
+confirmed by the user against real hardware.
+
+ITEM 38: ITEM 37's FIRST FIX WAS WRONG, suspend-then-hibernate FIRES ON EVERY LID-CLOSE, CORRECTED, 2026-09-14 session
+
+Real test immediately after deploying item 37's fix: closed lid, waited,
+opened it. User-observed wake time: keyboard backlight 4s, screen 5-6s.
+Pulled the exact kernel journal for that cycle (suspend entry (deep)
+17:13:33.120265 -> suspend exit 17:13:47.967866, confirmed real S3 only,
+"PM: suspend entry"/"PM: suspend exit", not hibernation). Kernel resume
+itself again fast and clean.
+
+BUT the facetimehd hook still fired its full camera reload immediately
+after "PM: suspend exit" ("Found FaceTime HD camera with device id: 1570"
+followed by the full PLL/DDR/firmware-load sequence), proving item 37's
+fix did not actually work as intended.
+
+ROOT CAUSE: item 37's case list included "suspend-then-hibernate" as a
+hibernate-class verb. This machine's HandleLidSwitch is configured as
+suspend-then-hibernate (see mac_sleep_wake_sources / periodic sleep
+memory). Confirmed empirically: systemd passes $2=suspend-then-hibernate
+on EVERY lid-close under that policy, including a plain few-second S3
+sleep that never actually escalates to a real on-disk hibernate write --
+not only on the ones that do. Including it in the match list reproduced
+the exact same bug item 37 was meant to fix.
+
+FIX: removed suspend-then-hibernate from the match list entirely,
+keeping only the two unambiguous verbs: hibernate and hybrid-sleep.
+Deployed live and updated in README.md.
+
+OPEN RISK, NOT YET RESOLVED: it is not yet confirmed whether a real
+auto-escalation to hibernate (lid stays closed past HibernateDelaySec =
+15min, systemd internally transitions from the initial suspend into a
+real hibernate without the user doing anything) invokes this hook a
+second time with the literal $2=hibernate for that specific transition,
+or whether the whole suspend-then-hibernate cycle only ever gets called
+once with $2=suspend-then-hibernate regardless of whether it actually
+reaches hibernation. If the latter, this fix would leave the original
+item-23 freeze bug unprotected for the auto-escalation path specifically
+(a manual `systemctl hibernate` is unaffected either way, and was
+validated earlier this session). This needs a real test: close the lid
+and leave it closed for the full 15 minutes, letting HibernateDelaySec
+elapse naturally, then check whether facetimehd was actually
+unloaded/reloaded around that specific transition (e.g. via a fresh
+dmesg timestamp check for the facetimehd probe message coinciding with
+the real "PM: hibernation entry" kernel log line, not the earlier S3
+entry). Do not consider item 37/38 closed until this is done.
+
+ITEM 39: macbat_fix: SIGNAL FULL ONCE charge_now REACHES charge_full, NOT WHEN EC BITS FLIP, 2026-09-14 session
+
+SYMPTOM: upower/status kept reporting "Charging" for 20+ minutes after
+capacity reached 100% (charge_now == charge_full exactly, 4054000 ==
+4054000 uAh), with current_now still real and slowly tapering (710mA ->
+667 -> 658 -> 335 -> 250mA over that window, never frozen). Confirmed
+not a stale/garbage-read bug (item 34): the numbers were genuinely still
+moving, consistent with a real top-balance trickle tail on this aged
+(84.5% health, 301 cycle) pack.
+
+ROOT CAUSE: macbat_fix's status logic (added in an earlier session, see
+the OVER_CHARGED_ALARM comment in the source) only reports Full when the
+EC's own BatteryStatus bits (FULLY_CHARGED 0x0010, or this bq20z451
+firmware's real completion signal OVER_CHARGED_ALARM 0x8000) are set.
+Those bits only flip once the EC's own internal termination-current
+threshold is crossed, which can lag well behind charge_now reaching
+charge_full whenever the pack has a long float/balance tail (more common
+on an aged pack like this one).
+
+FIX: added a fallback in macbat_update(): while on AC (pwrs true) and
+neither hardware completion bit is set yet, check charge_now_uah >=
+charge_full_uah using our own already-read SBS charge registers, and
+report POWER_SUPPLY_STATUS_FULL as soon as that's true, regardless of
+the EC bits. The real trickle current keeps flowing in the background
+(current_now still reports its real, accurate value; nothing about the
+underlying charge process is touched), only the *status* userspace sees
+changes, per explicit user request: "once the charge is full we shall
+signal charged, and let trickle do its job alone."
+
+Deployed live: edited macbat-fix/macbat_fix.c in the repo, copied to
+/usr/src/macbat-fix-1.0/, dkms remove + dkms install for the running
+kernel, rmmod/modprobe. Confirmed immediately: status flipped from
+Charging to Full, upower state now "fully-charged", capacity unchanged
+at real 84.4583% health.
+
+ITEM 40: ITEM 38's OPEN RISK RESOLVED -- AUTO-ESCALATED HIBERNATE CONFIRMED TO FIRE $2=hibernate, 2026-09-14 session
+
+Set HibernateDelaySec=1min via a debug drop-in
+(/etc/systemd/sleep.conf.d/99-debug-hibernate-delay.conf) specifically to
+force a real auto-escalation test. Real test: lid closed 18:01:10, real
+S3 suspend for 31 minutes, lid opened 18:31:58. Because the elapsed time
+far exceeded the 1-minute delay, opening the lid woke the machine from
+S3 (systemd-sleep: "System returned from sleep operation
+'suspend-then-hibernate'" at 18:31:59) and suspend-then-hibernate's own
+internal delay-elapsed check immediately fired a SEPARATE, real hibernate
+operation one second later (systemd-sleep: "Performing sleep operation
+'hibernate'..." at 18:32:00), confirmed via kernel log as a genuine S4
+transition (ACPI: PM: Preparing to enter system sleep state S4 ->
+PM: hibernation: hibernation entry -> 790018 pages / 3.16GB image saved
+in 2.09s -> PM: hibernation exit), completing cleanly ~55 seconds later
+(18:32:55) with no freeze, matching the original item-23 bug's exact
+failure point but NOT recurring.
+
+This looked confusing in the moment (briefly woke, screen came on, then
+went dark again almost immediately, required a second wake) but is
+fully expected behavior at a 1-minute delay after a long sleep, not a
+lid-sensor bug -- documented here so it isn't mistaken for one in a
+future session.
+
+CRITICALLY, this also resolves item 38's open risk: the kernel log shows
+facetimehd's fthd_hw_deinit firing at 18:32:55.188487 (right as the real
+S4 transition begins) and a full clean reinit through to
+"PM: hibernation exit" -- proving the item 37/38 hook (scoped to
+$2=hibernate|hybrid-sleep) DOES fire correctly for an auto-escalated
+hibernate triggered internally by suspend-then-hibernate's own timer,
+not just a manual `systemctl hibernate` (already validated earlier).
+Both hibernate-class paths are now confirmed covered. Item 37/38/40
+together can be considered CLOSED for the facetimehd scoping question.
+
+HibernateDelaySec remains at the 1min debug value pending the user's
+decision on reverting to the normal 15min.
+
+ITEM 41: RTC ALARM WILL NOT WAKE FROM DEEP S3 IN CLAMSHELL, ROOT CAUSE OF THE
+"SUSPEND-THEN-HIBERNATE NEVER AUTO-HIBERNATES" BUG, 2026-09-14 session
+
+SYMPTOM: with HandleLidSwitch=suspend-then-hibernate and HibernateDelaySec
+set, the machine never escalated to a real hibernate on its own. Closing the
+lid for 31 minutes left it in plain S3 the whole time; it only hibernated
+after the user opened the lid (waking it), which looked like "it woke up by
+itself then immediately slept again then needed a second wake".
+
+NOT A SYSTEMD BUG. systemd did everything correctly, proven with
+SYSTEMD_LOG_LEVEL=debug on systemd-suspend-then-hibernate.service:
+    18:51:57.763  Set timerfd wake alarm for 59s
+    18:51:58.035  Performing sleep operation 'suspend'...
+    18:54:18.538  System returned from sleep operation   <- 2min20s, = lid open
+    18:54:19.212  Attempting to hibernate
+It armed a correct 59s CLOCK_BOOTTIME_ALARM timerfd and the machine simply
+slept through it.
+
+CONTROLLED ISOLATION (four cells, same kernel mechanism each time, a small
+C program arming a CLOCK_BOOTTIME_ALARM timerfd across a suspend, plus a
+systemd-inhibit handle-lid-switch lock so logind could not interfere):
+    s2idle  + lid closed -> WAKES  (verified, zero lid events in journal)
+    s2idle  + lid closed -> WAKES  (historically: the old ~102s retrigger loop)
+    deep S3 + lid open   -> WAKES  (18:46:41 suspend -> 18:47:16 self-wake)
+    deep S3 + lid closed -> DOES NOT WAKE (slept through a 75s alarm for 3.5min)
+Root cause: this Mac's firmware does not honor an RTC alarm wake in clamshell
+while in real S3. suspend-then-hibernate therefore cannot self-escalate,
+because the wake that triggers its "has the delay elapsed?" check never fires.
+
+CORRECTION TO EARLIER WORK: rtc_cmos.use_acpi_alarm=1 (added in an earlier
+session, documented as the fix for the ~102s retrigger loop) is and always
+was a NO-OP on this machine. The kernel force-enables it via a DMI quirk in
+drivers/rtc/rtc-cmos.c::use_acpi_alarm_quirks(): Intel vendor plus
+dmi_get_bios_year() >= 2015 sets use_acpi_alarm = true unconditionally, and
+it runs during probe, AFTER module parameter parsing, so the command line can
+never turn it off. This machine reports BIOS date 08/23/2022 (Apple firmware
+474.0.0.0.0 on 2013 hardware), so it trips the quirk. Verified empirically:
+removed the parameter from /etc/default/limine, rebooted, and
+/sys/module/rtc_cmos/parameters/use_acpi_alarm still read Y. Whatever fixed
+the old retrigger loop, it was not this parameter. rtc_cmos is built in (not
+a module) so the quirk cannot be patched out without rebuilding the kernel.
+
+HOW macOS AVOIDS THE PROBLEM ENTIRELY (from the real macOS volume, mounted
+read only via apfs-fuse, /private/var/log/powermanagement/*.asl):
+    hibmode=3 standbydelaylow=10800 standbydelayhigh=86400
+macOS uses hibernatemode=3: it writes the hibernation image to disk UP FRONT
+at sleep time and keeps RAM powered. After standbydelay the SMC cuts RAM
+power autonomously in hardware. macOS therefore never needs to wake itself at
+a deadline, so the missing RTC-wake-in-clamshell capability never matters to
+it. Every wake in macOS's own logs is EC.LidOpen, SPIT, or HID activity --
+there is not a single RTC or timer wake recorded.
+
+BOOT CAMP CHECKED AND RULED OUT: extracted BootCamp.msi from
+bootcamp5.1.5769.zip (msiextract) to see whether Apple ships a non-Darwin
+power/wake mechanism. It does not. The package contains only peripheral
+drivers (keyboard, trackpad, camera, Bluetooth, display, SD reader, ODD,
+remote). MacHALDriver.sys is a 24KB HAL shim (PDB path
+AppleHAL\x64\Win8Release, imports HAL.dll) with zero SMC, wake, power or RTC
+references; neither AppleControlPanel.exe nor KeyAgent.sys reference SMC
+either. Windows on this Mac uses the same plain ACPI path Linux does and
+would hit the identical clamshell limitation. The SMC standby mechanism is
+Darwin-only, exactly like DTLK, _PS0/RP06 and APPD/APPU.
+
+FIX ADOPTED: hybrid-sleep on lid close (/etc/systemd/logind.conf.d/
+99-lid-hybrid-sleep.conf, HandleLidSwitch=hybrid-sleep). This is the direct
+Linux equivalent of macOS hibernatemode=3: image written first, then suspend
+to RAM, so no timed wake is ever required and a flat battery costs nothing
+but a slower resume from the image. Verified working end to end on real
+hardware:
+    19:30:41.67  Starting System Hybrid Suspend+Hibernate  (from lid close)
+    19:30:41.81  Performing sleep operation 'hybrid-sleep'
+                 Image size after compression: 1019344 kbytes (~1GB)
+                 ACPI: PM: Preparing to enter system sleep state S3
+    19:31:18.34  Lid opened
+    19:31:18.79  System returned from sleep operation
+The facetimehd hook's $2 scoping (items 37/38) already covered hybrid-sleep,
+so it fired correctly without further change.
+
+ITEM 42: FINAL SLEEP CONFIGURATION AND STANDBY POWER MEASUREMENTS, 2026-09-14 session
+
+Measured standby draw from upower's own charge history, using the gaps it
+leaves while suspended (upower stops logging during sleep, so the charge
+delta across a gap is real sleep consumption):
+
+  deep S3, 31 minute sample on battery (the 18:01:08 -> 18:31:59 clamshell
+  test): 99.975% -> 99.877%, a drop of 0.098%. Against a 4054 mAh pack that
+  is about 4 mAh over 0.515 h = 7.7 mA = roughly 0.06 W, i.e. weeks of
+  standby.
+
+  Shorter deep S3 gaps (2.4 min and 3.5 min) also showed exactly
+  0.098-0.099%, which is a single quantization step (charge_now only moves in
+  1 mAh increments), so those are resolution-floor artifacts and were
+  correctly discarded rather than reported as rates.
+
+  No clean s2idle-on-battery sample was obtained. One earlier 7.4 minute gap
+  suggested about 3.1 W but it could not be verified as actually-asleep
+  rather than awake-and-idle, so it was NOT used. The expected 1-3 W range
+  for s2idle on Haswell is stated in the docs as typical, not as measured.
+
+DECISION: deep S3 plus hybrid-sleep on lid close. Rationale: the standby
+difference (weeks vs hours) outweighs the wake-speed difference, and
+hybrid-sleep removes the only real risk of deep S3 here (that a flat battery
+loses the session), without needing the RTC clamshell wake this firmware
+refuses.
+
+FINAL CONFIG AS DEPLOYED:
+  /etc/systemd/sleep.conf.d/50-deep-s3.conf        MemorySleepMode=deep
+  /etc/systemd/logind.conf.d/50-lid-hybrid-sleep.conf
+                                                   HandleLidSwitch=hybrid-sleep
+                                                   HandleLidSwitchExternalPower=hybrid-sleep
+  /etc/initcpio/acpi_override/ssdt5-dtlk-fix.aml   DTLK Sleep(2000)->Sleep(100)
+  /etc/initcpio/acpi_override/mbread.aml           \_SB.MBRD SBS read wrapper
+  /usr/lib/systemd/system-sleep/facetimehd         scoped to hibernate|hybrid-sleep
+  /usr/lib/systemd/system-sleep/disable-d3cold     unchanged
+  XHC1 wake left disabled (udev rule), LID0 enabled: under deep S3 the lid
+  alone wakes the machine, so the keyboard wake chain is not needed.
+
+All debug drop-ins removed: 98-debug-deep-s3-test.conf,
+99-debug-hibernate-delay.conf, 99-zz-s2idle-test.conf, and the
+systemd-suspend-then-hibernate.service.d debug logging drop-in.
+HibernateDelaySec is back to the base 15min and is now irrelevant, since
+hybrid-sleep has no timer (confirmed in systemd v261 source: only
+SLEEP_SUSPEND_THEN_HIBERNATE goes through execute_s2h()/custom_timer_suspend();
+SLEEP_HYBRID_SLEEP calls execute() directly).
+
+rtc_cmos.use_acpi_alarm=1 removed from /etc/default/limine as a proven no-op
+(see item 41). The line is left commented out there with an explanation
+rather than deleted.
+
+STILL UNVERIFIED: resume-from-disk has not been deliberately exercised. The
+18:32 auto-escalated hibernate very likely did it (real S4 entry/exit plus
+the user having to power the machine back on), but it cannot be confirmed
+from the journal, because the image-loading messages belong to the temporary
+boot kernel that is then replaced by the restored one and never reach the
+persistent journal. A deliberate test is `systemctl hibernate` with the lid
+open, then power on: same code path hybrid-sleep depends on, and it avoids
+this machine's practical problem that the power button is under the lid.
+Resume config was pre-flighted and is correct: btrfs inspect-internal
+map-swapfile -r /swap/swapfile returns 6104320, exactly matching
+resume_offset on the kernel command line (note filefrag reports a different
+address space on btrfs and must not be used for this).
