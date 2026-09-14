@@ -2536,3 +2536,72 @@ for psd is weak here anyway: 2TB drive, 10.7TB written lifetime, versus typical
 600-1200TBW endurance. Also removed 6.7GB of psd crash-recovery backups that
 had accumulated from this session's hard resets, after taking one verified
 manual copy of the live profile.
+
+ITEM 46: SLOW RESUME LOCALISED EXACTLY TO cpuhp STEP 83 (bringup_cpu), NO FIX
+FOUND, 2026-09-14 session
+
+MEASUREMENT METHOD SETTLED (this had flip-flopped twice, so it was tested
+directly): dmesg printk timestamps are correct here; journalctl is NOT. Proven
+by capturing the SAME resume from both sources:
+
+  line                     dmesg        journalctl -o short-monotonic
+  Enabling non-boot CPUs   509.438      517.681306
+  CPU1 is up               513.955      517.681331
+  CPU3 is up               516.236      517.681392
+  PM: suspend exit         518.028      517.823019
+  TOTAL                    8.59 s       0.14 s
+
+journalctl shows eight lines within 0.1ms of each other, which is physically
+impossible: those are kernel ring-buffer messages all drained to journald in
+one burst after resume, so they share a receive timestamp. dmesg preserves
+when the kernel actually emitted each line. The user independently reported
+that exact resume as "very slow", which matches dmesg's 8.59s and not
+journald's 0.14s. USE dmesg.
+
+WHERE THE TIME GOES, measured with the cpuhp tracepoints (cpuhp_enter /
+cpuhp_exit, trace_clock=global, which is immune to the per-CPU TSC
+restoration that happens on every resume):
+
+  4426.7 ms  cpu1  step 83   <- dominant
+  2620.4 ms  cpu3  step 83   <- dominant
+   704.0 ms  cpu1  step 146 (kvm/cpu)
+   701.3 ms  cpu1  step 199 (x86/msr)
+   579.1 ms  cpu3  step 191 (base/cacheinfo)
+   495.1 ms  cpu3  step 235 (sched)
+   402.0 ms  cpu3  step 187 (workqueue)
+
+Step 83 is cpu:bringup, i.e. bringup_cpu(), which starts the application
+processor and waits for it to report alive. That is the cost. The other
+callbacks look inflated too, but they run in the cpuhp/N kthread and can be
+preempted during a busy resume, so those figures are not trustworthy on their
+own; step 83 is.
+
+Not thermal: core_throttle_count and package_throttle_count are 0 on all CPUs.
+Not one buggy callback: it is the AP itself failing to come alive promptly.
+cpu2 always costs about 5 ms because it is cpu0's sibling hyperthread on a
+physical core that is already running.
+
+STRUCTURAL PATTERN worth recording, from four clean samples: cpu3 is
+consistently 1762 to 2382 ms every time, while cpu1 swings wildly from 415 ms
+to 12436 ms. Two different behaviours on the two threads of the same physical
+core. Unexplained.
+
+cpu_init_udelay=1 TESTED AND DISPROVEN. Four resumes measured 16.36 s, 7.09 s,
+5.88 s and 3.14 s, mean 8.12 s, against a single-sample baseline of 8.59 s.
+That is inside the noise given samples range 3 to 16 seconds. Reverted from
+/etc/default/limine, as was tsc=reliable (item 43).
+
+KNOWN ISSUE, NO PUBLISHED FIX. Confirmed as widespread on MacBooks:
+  https://forums.linuxmint.com/viewtopic.php?t=456323  (same symptom, the
+    only remedy offered is the CPU-parking hook, which hangs this machine,
+    see item 45)
+  https://bugs.launchpad.net/ubuntu/+source/linux/+bug/490742  (MacBook Pro,
+    very slow S3 resume, marked Won't Fix in 2011)
+  https://bbs.archlinux.org/viewtopic.php?id=221681  (different problem,
+    spurious wakeups, not this)
+
+WHY IT CANNOT BE PUSHED FURTHER FROM USERSPACE: the AP's slow phase happens in
+early assembly and C before the CPU is online, so no tracepoint, ftrace hook
+or userspace tool can observe it. Going deeper would need a patched kernel
+with instrumentation inside do_boot_cpu()/start_secondary(). Characterised but
+unfixable at this level. Do not spend more time here without new information.
