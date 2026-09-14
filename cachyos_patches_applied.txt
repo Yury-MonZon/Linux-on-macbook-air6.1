@@ -2480,3 +2480,59 @@ The CPU sensors (TC*) sit in a clearly separate 47-55 C band, so the value is
 definitely not a CPU reading. Note that "TB = Temperature Battery" is Apple SMC
 community convention, not documented by Apple, which is exactly why the SBS
 register rather than the SMC key is the basis for this property.
+
+ITEM 45: CPU PARKING ACROSS SUSPEND, THREE ATTEMPTS, THREE FAILURES, ABANDONED
+PERMANENTLY, 2026-09-14 session
+
+Item 43 established that bringing secondary CPUs back online dominates resume
+time (377ms, 2533ms, once 16.9s per core) and that parking them beforehand
+avoids it (kernel resume 3.85s -> 1.56s on the one cycle that worked). Three
+increasingly careful attempts were made to do this safely. All three broke the
+machine, with an identical signature: the system dies immediately after the
+offline completes, at "Performing sleep operation 'suspend'...", and NEVER
+reaches "PM: suspend entry".
+
+  Attempt 1: offline all secondary cores (cpu1,2,3) in a sleep hook.
+             Result: hard hang, power reset required.
+  Attempt 2: offline only the non-boot PHYSICAL core (cpu1+cpu3), keeping
+             cpu0+cpu2 online so the system is never single-CPU; hook renamed
+             zz-* to run last; fail-safe abort; timeouts; synced disk log.
+             Result: suspend never happened; system stayed awake but I/O was
+             wedged (no wifi, nothing would launch, cursor still moved).
+  Attempt 3: same as 2, but with profile-sync-daemon disabled first, having
+             found it was force-timing-out a 9.5s / 1.7GB disk write on every
+             suspend (see below) and suspecting it as the real cause.
+             Result: hard hang again, identical to attempt 1.
+
+Attempt 3 disproves the profile-sync-daemon theory, and attempt 2 disproves
+the "it broke because the system went single-CPU" theory. The remaining
+conclusion is simply that this machine cannot complete a suspend transition if
+userspace has offlined CPUs immediately beforehand, regardless of how many,
+which ones, or what else is running. DO NOT ATTEMPT A FOURTH VARIANT. The
+saving on offer was about 2.3s of resume; the cost was three hard resets.
+
+Everything was removed: /usr/lib/systemd/system-sleep/zz-cpu-park and the
+cpu-park-restore.service safety net. The earlier crude version remains parked
+at /root/cpu-offline.disabled purely as a historical artifact.
+
+What DID work and is worth keeping from this: the diagnostic design. Writing
+progress to /var/log/cpu-park.log with an fsync after each line meant the
+evidence survived every hard reset, which is the only reason the failure could
+be characterised at all. The kernel log stops dead and tells you nothing.
+
+SIDE FINDING, GENUINELY VALUABLE, KEPT: profile-sync-daemon was holding a
+DELAY inhibitor on every suspend and logind was repeatedly logging "Delay lock
+is active ... but inhibitor timeout is reached". Measured directly: a psd
+resync takes 9499 ms while logind's InhibitDelayMaxSec default is 5000 ms, so
+every single suspend was force-killing a partially-complete 1.7GB write. psd
+was also holding that 1.7GB browser profile in tmpfs, i.e. 1.7GB of this
+machine's 7.7GB RAM, which is very likely connected to the recurring
+"Under memory pressure, flushing caches" messages seen all session.
+
+psd was disabled (profile correctly unsynced back to a real on-disk directory
+first, verified 1.7G and not a symlink). This frees 1.7GB of RAM and removes a
+guaranteed forced-timeout bulk write from every suspend. The SSD-wear rationale
+for psd is weak here anyway: 2TB drive, 10.7TB written lifetime, versus typical
+600-1200TBW endurance. Also removed 6.7GB of psd crash-recovery backups that
+had accumulated from this session's hard resets, after taking one verified
+manual copy of the live profile.
