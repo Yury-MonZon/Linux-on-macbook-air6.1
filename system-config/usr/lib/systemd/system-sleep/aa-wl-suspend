@@ -1,0 +1,49 @@
+#!/bin/sh
+# aa-wl-suspend - unload Broadcom wl across suspend, reload after resume.
+#
+# Runs first on suspend (aa* sorts before disable-d3cold/tlp), which takes
+# the proprietary driver - and its resume quirks, scan storms and sysfs
+# state - out of the suspend path before tlp's suspend-time radio/PCI work
+# runs. Reloaded on resume.
+#
+# OBSERVABILITY: every run appends one timestamped line to
+# /var/log/wl-suspend.log recording wl loaded-state before/after and the
+# modprobe exit code, so a silent failure is distinguishable from a skip.
+#
+# SAFETY: every operation is timeout-bounded and failures are swallowed.
+# Worst case (unload times out or reload fails) the machine suspends and
+# resumes exactly as it does today. This hook can never abort or stall a
+# suspend; it always exits 0.
+LOG=/var/log/wl-suspend.log
+
+log() {
+  printf '%s %s %s rc=%s\n' "$(date +%H:%M:%S)" "$1" "$2" "$3" >> "$LOG" 2>/dev/null
+  sync -f "$LOG" 2>/dev/null
+}
+
+wl_loaded() {
+  lsmod 2>/dev/null | grep -aq '^wl '
+}
+
+case "$1" in
+  pre)
+    wl_loaded && BEFORE=yes || BEFORE=no
+    timeout 15 modprobe -r wl 2>/dev/null
+    RC=$?
+    wl_loaded && AFTER=yes || AFTER=no
+    log "pre-unload" "$BEFORE->$AFTER" "$RC"
+    ;;
+  post)
+    wl_loaded && BEFORE=yes || BEFORE=no
+    timeout 30 modprobe wl 2>/dev/null
+    RC=$?
+    wl_loaded && AFTER=yes || AFTER=no
+    log "post-reload" "$BEFORE->$AFTER" "$RC"
+    # wpa_supplicant wedges when its interface vanishes beneath it at unload
+    # (re-acquire fails forever on stale state). A fresh daemon lets NM grab
+    # a clean interface. Harmless if already healthy.
+    timeout 20 systemctl restart wpa_supplicant 2>/dev/null
+    log "post-supplicant" "restart" "$?"
+    ;;
+esac
+exit 0

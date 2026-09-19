@@ -1,0 +1,27 @@
+facetimehd-dkms (AUR, 0.7.0.2): fix build against kernel 7.2+ (strncpy removed)
+
+Kernel 7.2 removed strncpy() entirely (six-year, 360+ patch cleanup effort,
+landed June 2026). facetimehd-dkms 0.7.0.2 fails to build against it:
+
+    fthd_v4l2.c:399: error: call to undeclared library function 'strncpy'
+
+Fix: use the kernel's own recommended drop-in replacement, strscpy() (same
+3-argument signature). Apply directly to the DKMS-registered source so it
+survives module rebuilds (NOT /var/lib/dkms/.../build/, which is a scratch
+copy DKMS regenerates from the registered source on every build):
+
+    /usr/src/facetimehd-0.7.0.2/fthd_v4l2.c
+
+Then: sudo dkms install facetimehd/0.7.0.2 -k <kernel-version>
+
+--- a/fthd_v4l2.c
++++ b/fthd_v4l2.c
+@@ -396,7 +396,7 @@
+ 	}
+
+ 	fmt->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-	strncpy(fmt->description, desc, sizeof(fmt->description));
++	strscpy(fmt->description, desc, sizeof(fmt->description));
+
+ 	return 0;
+ }

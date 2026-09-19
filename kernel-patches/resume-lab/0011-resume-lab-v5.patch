@@ -1,0 +1,854 @@
+--- a/drivers/base/power/main.c	2026-09-19 01:24:50.980425658 +0200
++++ b/drivers/base/power/main.c	2026-09-19 01:29:55.615248018 +0200
+@@ -30,6 +30,7 @@
+ #include <linux/sched/debug.h>
+ #include <linux/sysctl.h>
+ #include <linux/async.h>
++#include <linux/cpu.h>
+ #include <linux/suspend.h>
+ #include <trace/events/power.h>
+ #include <linux/cpufreq.h>
+@@ -1253,7 +1254,25 @@
+ 	if (READ_ONCE(async_error))
+ 		dpm_save_failed_step(SUSPEND_RESUME);
+ 
++#ifdef CONFIG_PM_SLEEP_SMP
++	/*
++	 * A non-stock resume-lab mode (kernel/power/main.c) may still have
++	 * CPUs short of CPUHP_ONLINE at this point (see
++	 * pm_resume_cpu_online_pending(), kernel/cpu.c). Running
++	 * cpufreq_resume() here would clear cpufreq_suspended before those
++	 * CPUs join, causing cpufreq_policy_online() to attempt a live
++	 * governor (re)start against them instead of the single coherent
++	 * restart stock resume always does after every CPU is already back.
++	 * Whichever resume path still has work left calls cpufreq_resume()
++	 * itself once that work is done. Inert under stock (mode 0).
++	 */
++	if (pm_cpufreq_defer && pm_resume_cpu_online_pending())
++		pr_info("PM: cpufreq_resume() deferred past ONLINE walk\n");
++	else
++		cpufreq_resume();
++#else
+ 	cpufreq_resume();
++#endif
+ 	devfreq_resume();
+ 	trace_suspend_resume(TPS("dpm_resume"), state.event, false);
+ }
+--- a/include/linux/cpu.h	2026-09-19 01:24:50.976350986 +0200
++++ b/include/linux/cpu.h	2026-09-19 01:27:54.611075847 +0200
+@@ -145,6 +145,10 @@
+ #ifdef CONFIG_PM_SLEEP_SMP
+ extern int freeze_secondary_cpus(int primary);
+ extern void thaw_secondary_cpus(void);
++extern void thaw_secondary_cpus_kick_only(void);
++extern void pm_finalize_cpu_resume(void);
++extern bool pm_resume_cpu_online_pending(void);
++extern void pm_ap_bringup_post_resume(void);
+ 
+ static inline int suspend_disable_secondary_cpus(void)
+ {
+@@ -162,6 +166,10 @@
+ 
+ #else /* !CONFIG_PM_SLEEP_SMP */
+ static inline void thaw_secondary_cpus(void) {}
++static inline void thaw_secondary_cpus_kick_only(void) {}
++static inline void pm_finalize_cpu_resume(void) {}
++static inline bool pm_resume_cpu_online_pending(void) { return false; }
++static inline void pm_ap_bringup_post_resume(void) {}
+ static inline int suspend_disable_secondary_cpus(void) { return 0; }
+ static inline void suspend_enable_secondary_cpus(void) { }
+ #endif /* !CONFIG_PM_SLEEP_SMP */
+--- a/include/linux/suspend.h	2026-09-19 01:24:50.999314949 +0200
++++ b/include/linux/suspend.h	2026-09-19 11:37:25.202706644 +0200
+@@ -142,6 +142,65 @@
+ 	void (*end)(void);
+ };
+ 
++/*
++ * Resume lab knobs (single experimental vehicle, kernel/power/main.c).
++ * Sysfs writes under /sys/power/ take effect on the NEXT suspend; the
++ * in-progress resume always finishes with whatever mode it started with
++ * (each mode reads pm_bringup_mode once, right after wake, and again at
++ * suspend_finish() -- do not rely on the two reads staying consistent if
++ * you rewrite this mid-cycle from a script; change it, then trigger one
++ * suspend, don't race the two).
++ *
++ * pm_bringup_mode:
++ *   0 = stock thaw_secondary_cpus() at Enable_cpus. Control/baseline,
++ *       byte-for-byte the original behavior.
++ *   1 = kick nothing at Enable_cpus; a background kthread brings every
++ *       frozen CPU fully online, one at a time, strictly sequentially,
++ *       after user space is thawed and the console is back. SMT-order
++ *       safe by construction (sequential, one CPU at a time), but trades
++ *       that for a different, real hazard: every ONLINE transition now
++ *       races live userspace and a fully-resumed device tree -- the
++ *       shape of the 2014 Lan Tianyu RFC that Zijlstra/Wysocki rejected
++ *       upstream. Kept to measure that hazard fairly on this hardware,
++ *       not as a shipping candidate.
++ *   2 = kick every frozen CPU concurrently at Enable_cpus (including SMT
++ *       siblings of the same physical core), finalize to ONLINE
++ *       synchronously in suspend_finish(), under the freezer. NOT
++ *       SMT-safe: see the comment on pm_bringup_kick() in kernel/cpu.c.
++ *       Kept only as a fast/best-case reference point, not a shipping
++ *       candidate -- do not run this unattended.
++ *   3 = like 2, but stages the kick: only primary threads are kicked at
++ *       Enable_cpus; their siblings are kicked later, in
++ *       pm_finalize_cpu_resume(), strictly after every primary has
++ *       reached CPUHP_ONLINE. SMT-safe. On a frozen set that is a single
++ *       primary and its own sibling (this machine, always), expect a
++ *       modest win bounded by the device-resume window, not mode 2's
++ *       numbers -- the sibling's cost is never overlapped with anything
++ *       here, same as stock.
++ *
++ * pm_affskip: skip redundant kthread re-affining during the ONLINE walk
++ *   (default on). Independent of pm_bringup_mode; applies to any CPU
++ *   hotplug online event, not just resume.
++ * pm_cpufreq_defer: defer cpufreq_resume() past the ONLINE walk whenever
++ *   a non-stock mode leaves CPUs not yet online at the point stock would
++ *   have already finished (see pm_resume_cpu_online_pending() in
++ *   kernel/cpu.c). Inert under mode 0.
++ * pm_early_thaw: thaw user space right after the machine wakes (still
++ *   inside suspend_enter(), before Enable_cpus/CPU bringup and before the
++ *   noirq/early/main device-resume phases), instead of after all of that
++ *   completes. Independent of pm_bringup_mode -- combine with mode 3 to
++ *   let the desktop's cold start overlap the *entire* AP bringup and
++ *   device-resume window, not just the small slice mode 3 alone can hide
++ *   behind. Filesystems stay frozen either way (filesystems_thaw() is
++ *   unaffected); s2idle and any early-error path that bypasses
++ *   Enable_cpus are unaffected too (userspace_thawed_early stays false,
++ *   so suspend_finish() thaws normally). Off by default.
++ */
++extern int pm_bringup_mode;
++extern int pm_affskip;
++extern int pm_cpufreq_defer;
++extern int pm_early_thaw;
++
+ #ifdef CONFIG_SUSPEND
+ extern suspend_state_t pm_suspend_target_state;
+ extern suspend_state_t mem_sleep_current;
+--- a/kernel/cpu.c	2026-09-19 01:24:50.972260583 +0200
++++ b/kernel/cpu.c	2026-09-19 15:55:06.979369192 +0200
+@@ -19,6 +19,8 @@
+ #include <linux/delay.h>
+ #include <linux/export.h>
+ #include <linux/bug.h>
++#include <linux/freezer.h>
++#include <linux/cpufreq.h>
+ #include <linux/kthread.h>
+ #include <linux/stop_machine.h>
+ #include <linux/mutex.h>
+@@ -1882,11 +1884,106 @@
+ 
+ #ifdef CONFIG_PM_SLEEP_SMP
+ static cpumask_var_t frozen_cpus;
++static bool pm_ap_offline_pending;
++
++/*
++ * True while there is CPU bringup work left over from a non-stock resume
++ * mode (see include/linux/suspend.h for the mode legend) that has not
++ * reached CPUHP_ONLINE yet. Used together with pm_cpufreq_defer (kernel/
++ * power/main.c) to keep cpufreq_resume() (drivers/base/power/main.c) from
++ * running before every frozen CPU is back -- exactly the ordering stock
++ * resume gets for free, since stock's thaw_secondary_cpus() always
++ * finishes at Enable_cpus, long before cpufreq_resume() is reached.
++ *
++ * Deliberately computed from ground truth (frozen_cpus, pm_bringup_mode)
++ * on every call instead of being a separately maintained flag: the
++ * original resume-lab patch had exactly this class of bug (mode 1 never
++ * set its equivalent flag, so it never got the deferral mode 2 relied
++ * on). Deriving it means every mode that leaves frozen_cpus non-empty
++ * across the dpm_resume() -> cpufreq_resume() call site is covered
++ * automatically, with nothing to remember to wire up per mode.
++ */
++bool pm_resume_cpu_online_pending(void)
++{
++	return pm_bringup_mode != 0 && !cpumask_empty(frozen_cpus);
++}
++
++/*
++ * Defensive guard, not a proven fix: on this hardware, one observed hang
++ * bringing a secondary CPU back up happened when a new suspend started
++ * only ~8s after the previous resume's CPU bringup finished; ten
++ * consecutive clean cycles all had a ~60s+ gap. That is not a controlled
++ * experiment (a separate, earlier hang happened on a first attempt with
++ * no preceding rapid resume at all, so this is not shown to be the whole
++ * story), but making a new freeze wait for the right thing is safe
++ * regardless: it only ever adds a bounded delay before a freeze, never
++ * skips or weakens anything.
++ *
++ * Rather than only guessing a fixed delay, also wait for async work a CPU
++ * online transition is known to leave running: rcu_barrier() waits for
++ * any RCU callbacks queued during that ONLINE transition to complete,
++ * returning as soon as that is actually true -- near-instant when
++ * nothing is pending, correctly longer when something genuinely still
++ * needs to finish, instead of a fixed guess either way.
++ *
++ * A more specific target was considered -- this project's own earlier
++ * root-causing found a cpuset/sched-domain rebuild work item
++ * (rebuild_sd_workfn) that CPU online can leave running -- but it is
++ * queued on the shared system-wide workqueue, and the kernel explicitly
++ * warns against flushing that (flush_scheduled_work() is documented for
++ * removal: "Please avoid flushing system-wide workqueues", since it
++ * waits on unrelated work from every other subsystem, not just the one
++ * item of interest). Reaching that specific work item cleanly would need
++ * an export from kernel/sched/topology.c or kernel/cgroup/cpuset.c,
++ * which is out of scope here; rcu_barrier() plus the small fixed floor
++ * below is what is safe to do from this file alone.
++ *
++ * CPU_RESUME_SETTLE_FLOOR_MS is that fixed floor, kept as defense-in-
++ * depth on top of the rcu_barrier() wait, in case the actual mechanism
++ * is not fully captured by it either. Run unconditionally, even on the
++ * very first freeze after boot, since the recorded hang class is not
++ * known to require a preceding resume.
++ */
++#define CPU_RESUME_SETTLE_FLOOR_MS 500
++static ktime_t last_resume_complete;
++
++static void mark_resume_complete(void)
++{
++	last_resume_complete = ktime_get();
++}
++
++static void wait_resume_settle(void)
++{
++	ktime_t t0 = ktime_get();
++	s64 remaining_ms;
++
++	rcu_barrier();
++	/*
++	 * Logged unconditionally (even near-zero) rather than only above a
++	 * threshold: whether this is ever the thing actually worth waiting
++	 * for on this hardware is an open question this lab is meant to
++	 * answer, and a string of "0 ms" results is itself the answer.
++	 */
++	pr_info("PM: rcu_barrier() before freezing CPUs took %lld ms\n",
++		ktime_ms_delta(ktime_get(), t0));
++
++	if (!last_resume_complete)
++		return;
++
++	remaining_ms = CPU_RESUME_SETTLE_FLOOR_MS -
++		       ktime_ms_delta(ktime_get(), last_resume_complete);
++	if (remaining_ms > 0) {
++		pr_info("PM: waiting %lld ms since last resume before freezing CPUs\n",
++			remaining_ms);
++		msleep(remaining_ms);
++	}
++}
+ 
+ int freeze_secondary_cpus(int primary)
+ {
+ 	int cpu, error = 0;
+ 
++	wait_resume_settle();
+ 	cpu_maps_update_begin();
+ 	if (primary == -1) {
+ 		primary = cpumask_first(cpu_online_mask);
+@@ -1936,6 +2033,15 @@
+ 	 * supposed to do thaw_secondary_cpus() on the failure path.
+ 	 */
+ 	cpu_hotplug_disabled++;
++	/*
++	 * Matched by exactly one __cpu_hotplug_enable() somewhere in the
++	 * resume path. Modes 0/2/3 call it synchronously in their own
++	 * thaw/kick function; mode 1 calls it later, from
++	 * pm_ap_bringup_post_resume(), since Enable_cpus does nothing for
++	 * CPUs in that mode. This flag is what lets that call site tell
++	 * whether freeze actually ran this cycle (s2idle skips it).
++	 */
++	pm_ap_offline_pending = true;
+ 
+ 	cpu_maps_update_done();
+ 	return error;
+@@ -1977,10 +2083,286 @@
+ 	arch_thaw_secondary_cpus_end();
+ 
+ 	cpumask_clear(frozen_cpus);
++	mark_resume_complete();
+ out:
+ 	cpu_maps_update_done();
+ }
+ 
++/*
++ * Kick-only phase shared by resume-lab modes 2 and 3: send the wakeup
++ * IPI/SIPI (CPUHP_BP_KICK_AP) for some subset of frozen_cpus and return
++ * immediately. Each kicked AP parks at cpuhp_ap_sync_alive() until
++ * pm_finalize_cpu_resume() below releases it, so its hardware startup
++ * latency overlaps with whatever device-resume work runs next in
++ * suspend_enter() (Platform_wake onward).
++ *
++ * @primaries_only picks the subset:
++ *
++ *  false (mode 2, kept for comparison, NOT a shipping candidate): every
++ *    CPU in frozen_cpus, including SMT siblings of the same physical
++ *    core. arch/x86/kernel/smpboot.c's start_secondary() documents that
++ *    concurrent microcode loading on SMT siblings must be prohibited,
++ *    and load_ucode_ap() runs on every AP before it reaches the alive
++ *    gate this function's callers wait at -- so whenever the frozen set
++ *    contains a primary thread and its own sibling, this mode kicks both
++ *    of them concurrently. On this machine frozen_cpus is always exactly
++ *    {cpu1, cpu3} (core 0 never suspends; core 1 is a primary + its own
++ *    sibling), so every resume with this mode hits that case. It stays
++ *    in the lab so its timing/failure behavior can be measured side by
++ *    side with mode 3's, not because it is safe to run unattended.
++ *
++ *  true (mode 3): only the primary-thread subset of frozen_cpus.
++ *    Sibling threads are kicked later, in pm_finalize_cpu_resume(),
++ *    strictly after every primary in the frozen set has already reached
++ *    CPUHP_ONLINE -- the same primaries-then-secondaries ordering
++ *    cpuhp_bringup_cpus_parallel() already uses at boot (see above in
++ *    this file). No two SMT siblings are ever kicked while either one
++ *    could still be inside its microcode-sensitive window.
++ */
++static void pm_bringup_kick(bool primaries_only)
++{
++	const struct cpumask *pmask = cpuhp_get_primary_thread_mask();
++	static struct cpumask kick_mask;
++	int cpu, error;
++
++	cpu_maps_update_begin();
++	__cpu_hotplug_enable();
++	if (cpumask_empty(frozen_cpus))
++		goto out;
++
++	if (primaries_only && cpuhp_smt_aware())
++		cpumask_and(&kick_mask, frozen_cpus, pmask);
++	else
++		cpumask_copy(&kick_mask, frozen_cpus);
++
++	pr_info("Enabling non-boot CPUs ...\n");
++	arch_thaw_secondary_cpus_begin();
++
++	for_each_cpu(cpu, &kick_mask) {
++		error = _cpu_up(cpu, 1, CPUHP_BP_KICK_AP);
++		if (error)
++			pr_warn("Error kicking CPU%d: %d\n", cpu, error);
++	}
++out:
++	cpu_maps_update_done();
++}
++
++void thaw_secondary_cpus_kick_only(void)
++{
++	pm_bringup_kick(pm_bringup_mode == 3);
++}
++
++/*
++ * Complete the CPU bringup that thaw_secondary_cpus_kick_only() started.
++ * Synchronous, called from suspend_finish() before suspend_thaw_processes()
++ * (modes 2 and 3), so every CPUHP_ONLINE transition happens under the
++ * freezer -- same conditions as stock resume.
++ *
++ * Mode 3 (staged): pass 1 finishes whatever was already kicked
++ * (primaries only). Pass 2 then kicks and finishes the sibling threads --
++ * only once every primary in the frozen set has reached CPUHP_ONLINE, so
++ * only once it is certain no primary is still inside its microcode-
++ * sensitive window. Expect this mode's overlap benefit to be bounded by
++ * how much of the primary's own bring-up latency fits behind the device-
++ * resume window that ran between the kick and this call: on a frozen set
++ * that is a single primary plus its own sibling (this machine, always),
++ * the sibling's cost is never overlapped with anything and stays fully
++ * serial, same as stock -- do not expect this mode to reproduce mode 2's
++ * headline numbers, if any; it is only claiming the smaller, real,
++ * SMT-safe part of that win.
++ *
++ * Mode 2 (unstaged): pass 1 finishes everyone that was kicked, i.e.
++ * everyone in frozen_cpus; pass 2 is a no-op.
++ */
++void pm_finalize_cpu_resume(void)
++{
++	const struct cpumask *pmask = cpuhp_get_primary_thread_mask();
++	bool staged = pm_bringup_mode == 3 && cpuhp_smt_aware();
++	int cpu, error;
++	ktime_t t0, t1;
++
++	cpu_maps_update_begin();
++	if (cpumask_empty(frozen_cpus))
++		goto out;
++
++	pr_info("Completing CPU bringup\n");
++	t1 = ktime_get();
++
++	for_each_cpu(cpu, frozen_cpus) {
++		if (staged && !cpumask_test_cpu(cpu, pmask))
++			continue; /* sibling: not kicked yet, pass 2 below */
++
++		t0 = ktime_get();
++		trace_suspend_resume(TPS("CPU_ON"), cpu, true);
++		error = _cpu_up(cpu, 1, CPUHP_ONLINE);
++		trace_suspend_resume(TPS("CPU_ON"), cpu, false);
++		if (!error)
++			pr_info("CPU%d is up (%lld ms)\n", cpu,
++				ktime_ms_delta(ktime_get(), t0));
++		else
++			pr_warn("Error taking CPU%d up: %d\n", cpu, error);
++	}
++
++	if (staged) {
++		for_each_cpu(cpu, frozen_cpus) {
++			if (cpumask_test_cpu(cpu, pmask))
++				continue; /* primary: done in pass 1 above */
++
++			t0 = ktime_get();
++			error = _cpu_up(cpu, 1, CPUHP_BP_KICK_AP);
++			if (!error) {
++				trace_suspend_resume(TPS("CPU_ON"), cpu, true);
++				error = _cpu_up(cpu, 1, CPUHP_ONLINE);
++				trace_suspend_resume(TPS("CPU_ON"), cpu, false);
++			}
++			if (!error)
++				pr_info("CPU%d is up (%lld ms, staged)\n", cpu,
++					ktime_ms_delta(ktime_get(), t0));
++			else
++				pr_warn("Error taking CPU%d up: %d\n", cpu, error);
++		}
++	}
++
++	arch_thaw_secondary_cpus_end();
++	cpumask_clear(frozen_cpus);
++	mark_resume_complete();
++	pr_info("PM: bringup walk done in %lld ms\n",
++		ktime_ms_delta(ktime_get(), t1));
++out:
++	cpu_maps_update_done();
++}
++
++static DECLARE_WAIT_QUEUE_HEAD(pm_ap_bringup_wq);
++static bool pm_ap_bringup_pending;
++static struct task_struct *pm_ap_bringup_task;
++
++/*
++ * Deferred AP bringup worker (mode 1): complete the CPU bringup recorded
++ * in frozen_cpus in the background, after user space has been thawed and
++ * the console (screen) is back.
++ *
++ * Every CPU is brought up individually and fully sequentially (kick+wait
++ * +online in one _cpu_up() call, one CPU at a time; frozen_cpus is walked
++ * in cpu-number order). On this machine's frozen set ({cpu1, cpu3}) the
++ * primary (cpu1) therefore always finishes completely -- including its
++ * microcode-sensitive window -- before its own sibling (cpu3) is even
++ * kicked, so this mode has never actually had the SMT-ordering problem
++ * modes 2 shares. Its real, still-open risk is different: every one of
++ * these ONLINE transitions now races live, already-thawed userspace and
++ * a fully-resumed device tree, which is exactly the architecture the
++ * 2014 Lan Tianyu RFC used ("PM/CPU: Parallel enabling nonboot cpus with
++ * resume devices") and which Zijlstra/Wysocki rejected upstream for that
++ * reason (see upstream-submission.md). It stays in this lab specifically
++ * to reproduce that hazard class fairly, on this hardware, with the
++ * cpufreq ordering bug that also sank the RFC and 0004's first attempt
++ * now fixed (see the cpufreq_resume() call at the bottom of this
++ * function) -- so any misbehavior that remains in mode 1 isolates the
++ * live-userspace-race question on its own, rather than being conflated
++ * with a bug already known how to avoid.
++ */
++static int pm_ap_bringup_threadfn(void *unused)
++{
++	cpumask_var_t pending;
++	ktime_t t0, t1;
++	int cpu, error;
++
++	if (!alloc_cpumask_var(&pending, GFP_KERNEL))
++		return -ENOMEM;
++
++	set_freezable();
++	while (!kthread_should_stop()) {
++		wait_event_freezable(pm_ap_bringup_wq,
++				     pm_ap_bringup_pending ||
++				     kthread_should_stop());
++		if (kthread_should_stop())
++			break;
++
++		pm_ap_bringup_pending = false;
++
++		cpu_maps_update_begin();
++		cpumask_copy(pending, frozen_cpus);
++		cpu_maps_update_done();
++		if (cpumask_empty(pending))
++			continue;
++
++		pr_info("PM: bringing APs online in background\n");
++		t1 = ktime_get();
++
++		arch_thaw_secondary_cpus_begin();
++		for_each_cpu(cpu, pending) {
++			/* A nested suspend freezes us here, holding no locks. */
++			if (try_to_freeze())
++				break;
++
++			t0 = ktime_get();
++			trace_suspend_resume(TPS("CPU_ON"), cpu, true);
++			error = _cpu_up(cpu, 0, CPUHP_ONLINE);
++			trace_suspend_resume(TPS("CPU_ON"), cpu, false);
++			if (!error) {
++				pr_info("CPU%d is up (%lld ms, background)\n", cpu,
++					ktime_ms_delta(ktime_get(), t0));
++				cpu_maps_update_begin();
++				cpumask_clear_cpu(cpu, frozen_cpus);
++				cpu_maps_update_done();
++				continue;
++			}
++			pr_warn("Error taking CPU%d up: %d\n", cpu, error);
++		}
++		arch_thaw_secondary_cpus_end();
++
++		pr_info("PM: background bringup pass done in %lld ms\n",
++			ktime_ms_delta(ktime_get(), t1));
++
++		/*
++		 * Run the governor restart that was held back so it wouldn't
++		 * observe a still-frozen policy mid-walk (see
++		 * pm_resume_cpu_online_pending() above). Only once every
++		 * originally-frozen CPU actually made it to ONLINE -- if a
++		 * nested suspend broke the loop above early, frozen_cpus is
++		 * still non-empty and this correctly waits for a later pass.
++		 * cpufreq_resume() no-ops on its own (cpufreq_suspended
++		 * guard) if it already ran, so there is no harm in this being
++		 * reached more than once.
++		 */
++		if (cpumask_empty(frozen_cpus)) {
++			if (pm_cpufreq_defer)
++				cpufreq_resume();
++			mark_resume_complete();
++		}
++	}
++	free_cpumask_var(pending);
++	return 0;
++}
++
++/*
++ * Called once per resume from suspend_finish(), after the console is
++ * back (mode 1 only). Balances the cpu_hotplug_disabled++ from
++ * freeze_secondary_cpus() and wakes the background bringup thread.
++ * Falls back to the synchronous stock thaw if the thread cannot be
++ * created (which balances hotplug itself). No-op when
++ * freeze_secondary_cpus() did not run this cycle (e.g. s2idle).
++ */
++void pm_ap_bringup_post_resume(void)
++{
++	if (!pm_ap_offline_pending)
++		return;
++	pm_ap_offline_pending = false;
++
++	if (!pm_ap_bringup_task) {
++		pm_ap_bringup_task = kthread_run(pm_ap_bringup_threadfn, NULL,
++						 "pm_ap_bringup");
++		if (IS_ERR(pm_ap_bringup_task)) {
++			pr_err("PM: AP bringup thread failed, thawing synchronously\n");
++			pm_ap_bringup_task = NULL;
++			thaw_secondary_cpus();
++			return;
++		}
++	}
++	__cpu_hotplug_enable();
++	pm_ap_bringup_pending = true;
++	wake_up(&pm_ap_bringup_wq);
++}
++
+ static int __init alloc_frozen_cpus(void)
+ {
+ 	if (!alloc_cpumask_var(&frozen_cpus, GFP_KERNEL|__GFP_ZERO))
+--- a/kernel/kthread.c	2026-09-19 01:24:50.995639270 +0200
++++ b/kernel/kthread.c	2026-09-19 01:30:22.212504761 +0200
+@@ -25,6 +25,7 @@
+ #include <linux/slab.h>
+ #include <linux/freezer.h>
+ #include <linux/ptrace.h>
++#include <linux/suspend.h>
+ #include <linux/uaccess.h>
+ #include <linux/numa.h>
+ #include <linux/sched/isolation.h>
+@@ -912,7 +913,26 @@
+ 		 */
+ 		if (force || k->preferred_affinity || k->node != NUMA_NO_NODE) {
+ 			kthread_fetch_affinity(k, affinity);
+-			set_cpus_allowed_ptr(k->task, affinity);
++			/*
++			 * Resume-lab pm_affskip: when the task already runs on
++			 * exactly the affinity the kernel would apply,
++			 * set_cpus_allowed_ptr() would bail out at its own
++			 * cpumask_equal() check (kernel/sched/core.c) -- but
++			 * only after taking the task's pi_lock and the rq lock
++			 * for every single kthread on this list. The ONLINE
++			 * walk on the first wake after boot runs this list with
++			 * hundreds of already-affine entries; skipping the lock
++			 * dance here is what removes that multi-second cost.
++			 *
++			 * Only safe when user_cpus_ptr is NULL:
++			 * set_cpus_allowed_ptr() intersects the request against
++			 * user_cpus_ptr, so the effective mask can be narrower
++			 * than "affinity". When a user affinity is set, use the
++			 * real call.
++			 */
++			if (!pm_affskip || k->task->user_cpus_ptr ||
++			    !cpumask_equal(&k->task->cpus_mask, affinity))
++				set_cpus_allowed_ptr(k->task, affinity);
+ 		}
+ 	}
+ 
+--- a/kernel/power/main.c	2026-09-19 01:24:50.984245159 +0200
++++ b/kernel/power/main.c	2026-09-19 11:37:10.217255865 +0200
+@@ -213,6 +213,150 @@
+ 
+ power_attr(pm_async);
+ 
++/*
++ * Resume lab knobs. See the mode legend in include/linux/suspend.h.
++ * Default (0/1/1) is byte-for-byte stock behavior with the two auxiliary
++ * fixes (pm_affskip, pm_cpufreq_defer) armed but inert, since both are
++ * no-ops under mode 0.
++ */
++int pm_bringup_mode;
++int pm_affskip = 1;
++int pm_cpufreq_defer = 1;
++int pm_early_thaw;
++
++static int __init pm_lab_parse(char *str, int *val, int max, const char *name)
++{
++	int v;
++
++	if (kstrtoint(str, 10, &v) || v < 0 || v > max) {
++		pr_warn("PM: ignoring invalid %s='%s' (want 0-%d)\n",
++			name, str, max);
++		return 1;
++	}
++	*val = v;
++	return 1;
++}
++
++static int __init pm_bringup_setup(char *str)
++{
++	return pm_lab_parse(str, &pm_bringup_mode, 3, "pm_bringup");
++}
++__setup("pm_bringup=", pm_bringup_setup);
++
++static int __init pm_affskip_setup(char *str)
++{
++	return pm_lab_parse(str, &pm_affskip, 1, "pm_affskip");
++}
++__setup("pm_affskip=", pm_affskip_setup);
++
++static int __init pm_cpufreq_defer_setup(char *str)
++{
++	return pm_lab_parse(str, &pm_cpufreq_defer, 1, "pm_cpufreq_defer");
++}
++__setup("pm_cpufreq_defer=", pm_cpufreq_defer_setup);
++
++static int __init pm_early_thaw_setup(char *str)
++{
++	return pm_lab_parse(str, &pm_early_thaw, 1, "pm_early_thaw");
++}
++__setup("pm_early_thaw=", pm_early_thaw_setup);
++
++static ssize_t pm_bringup_mode_show(struct kobject *kobj,
++				    struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", pm_bringup_mode);
++}
++
++static ssize_t pm_bringup_mode_store(struct kobject *kobj,
++				     struct kobj_attribute *attr,
++				     const char *buf, size_t n)
++{
++	unsigned long val;
++
++	if (kstrtoul(buf, 10, &val))
++		return -EINVAL;
++
++	if (val > 3)
++		return -EINVAL;
++
++	pm_bringup_mode = val;
++	return n;
++}
++
++power_attr(pm_bringup_mode);
++
++static ssize_t pm_affskip_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", pm_affskip);
++}
++
++static ssize_t pm_affskip_store(struct kobject *kobj,
++				struct kobj_attribute *attr,
++				const char *buf, size_t n)
++{
++	unsigned long val;
++
++	if (kstrtoul(buf, 10, &val))
++		return -EINVAL;
++
++	if (val > 1)
++		return -EINVAL;
++
++	pm_affskip = val;
++	return n;
++}
++
++power_attr(pm_affskip);
++
++static ssize_t pm_cpufreq_defer_show(struct kobject *kobj,
++				     struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", pm_cpufreq_defer);
++}
++
++static ssize_t pm_cpufreq_defer_store(struct kobject *kobj,
++				      struct kobj_attribute *attr,
++				      const char *buf, size_t n)
++{
++	unsigned long val;
++
++	if (kstrtoul(buf, 10, &val))
++		return -EINVAL;
++
++	if (val > 1)
++		return -EINVAL;
++
++	pm_cpufreq_defer = val;
++	return n;
++}
++
++power_attr(pm_cpufreq_defer);
++
++static ssize_t pm_early_thaw_show(struct kobject *kobj,
++				  struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", pm_early_thaw);
++}
++
++static ssize_t pm_early_thaw_store(struct kobject *kobj,
++				   struct kobj_attribute *attr,
++				   const char *buf, size_t n)
++{
++	unsigned long val;
++
++	if (kstrtoul(buf, 10, &val))
++		return -EINVAL;
++
++	if (val > 1)
++		return -EINVAL;
++
++	pm_early_thaw = val;
++	return n;
++}
++
++power_attr(pm_early_thaw);
++
+ #ifdef CONFIG_SUSPEND
+ static ssize_t mem_sleep_show(struct kobject *kobj, struct kobj_attribute *attr,
+ 			      char *buf)
+@@ -1080,6 +1224,10 @@
+ #endif
+ #ifdef CONFIG_PM_SLEEP
+ 	&pm_async_attr.attr,
++	&pm_bringup_mode_attr.attr,
++	&pm_affskip_attr.attr,
++	&pm_cpufreq_defer_attr.attr,
++	&pm_early_thaw_attr.attr,
+ 	&wakeup_count_attr.attr,
+ #ifdef CONFIG_SUSPEND
+ 	&mem_sleep_attr.attr,
+--- a/kernel/power/power.h	2026-09-19 01:24:50.991906530 +0200
++++ b/kernel/power/power.h	2026-09-19 01:29:28.127982361 +0200
+@@ -351,4 +351,10 @@
+ 	cpuidle_resume();
+ }
+ 
++static inline void pm_sleep_enable_secondary_cpus_kick_only(void)
++{
++	thaw_secondary_cpus_kick_only();
++	cpuidle_resume();
++}
++
+ void dpm_save_errno(int err);
+--- a/kernel/power/suspend.c	2026-09-19 01:24:50.988252261 +0200
++++ b/kernel/power/suspend.c	2026-09-19 11:37:57.798137272 +0200
+@@ -27,6 +27,7 @@
+ #include <linux/syscore_ops.h>
+ #include <linux/swait.h>
+ #include <linux/ftrace.h>
++#include <linux/cpufreq.h>
+ #include <trace/events/power.h>
+ #include <linux/compiler.h>
+ #include <linux/moduleparam.h>
+@@ -409,6 +410,12 @@
+ 	local_irq_enable();
+ }
+ 
++/* Set by suspend_enter() when pm_early_thaw ran the thaw early this cycle;
++ * consumed and cleared by suspend_finish() so it thaws again only when the
++ * early path did not run. See the pm_early_thaw comment in suspend_enter().
++ */
++static bool userspace_thawed_early;
++
+ /**
+  * suspend_enter - Make the system enter the given sleep state.
+  * @state: System sleep state to enter.
+@@ -479,8 +486,35 @@
+ 	arch_suspend_enable_irqs();
+ 	BUG_ON(irqs_disabled());
+ 
++	/*
++	 * pm_early_thaw: start user space right here, before CPU bringup and
++	 * before noirq/early/main device resume, instead of waiting for all
++	 * of that to finish. File systems stay frozen (filesystems_thaw() is
++	 * unaffected) so on-disk state can't be touched by anything woken
++	 * here; combine with pm_bringup_mode 3 so the desktop's cold start
++	 * overlaps the whole AP-bringup + device-resume window, not just the
++	 * slice mode 3 alone can hide.
++	 *
++	 * Reached only on the normal path (not by the pm_sleep_disable_
++	 * secondary_cpus() failure -> goto Enable_cpus above, and not by the
++	 * s2idle -> goto Platform_wake path earlier in this function), so
++	 * userspace_thawed_early correctly stays false and suspend_finish()
++	 * thaws normally on those paths.
++	 */
++	if (pm_early_thaw) {
++		userspace_thawed_early = true;
++		suspend_thaw_processes();
++	}
++
+  Enable_cpus:
+-	pm_sleep_enable_secondary_cpus();
++	if (pm_bringup_mode == 2 || pm_bringup_mode == 3)
++		pm_sleep_enable_secondary_cpus_kick_only();
++	else if (pm_bringup_mode == 1)
++		cpuidle_resume();
++	else
++		pm_sleep_enable_secondary_cpus();
++	if (pm_bringup_mode)
++		pr_info("resume bringup mode %d\n", pm_bringup_mode);
+ 
+  Platform_wake:
+ 	platform_resume_noirq(state);
+@@ -559,10 +593,28 @@
+  */
+ static void suspend_finish(void)
+ {
+-	suspend_thaw_processes();
++	/*
++	 * Capture before pm_finalize_cpu_resume() clears frozen_cpus (modes
++	 * 2/3 only; always false under 0/1, which never leave dpm_resume()
++	 * with frozen_cpus non-empty in the first place).
++	 */
++	bool cpufreq_deferred = pm_resume_cpu_online_pending();
++
++	if (pm_bringup_mode == 2 || pm_bringup_mode == 3)
++		pm_finalize_cpu_resume();
++
++	if (cpufreq_deferred && pm_cpufreq_defer)
++		cpufreq_resume();
++
++	if (!userspace_thawed_early)
++		suspend_thaw_processes();
++	userspace_thawed_early = false;
+ 	filesystems_thaw();
+ 	pm_notifier_call_chain(PM_POST_SUSPEND);
+ 	pm_restore_console();
++
++	if (pm_bringup_mode == 1)
++		pm_ap_bringup_post_resume();
+ }
+ 
+ /**

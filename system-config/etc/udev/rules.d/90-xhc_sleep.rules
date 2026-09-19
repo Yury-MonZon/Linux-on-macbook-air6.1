@@ -1,0 +1,2 @@
+# disable ACPI wake from S3 on XHC1 (USB/Bluetooth controller) — known MacBookAir6,x spurious-wake source
+SUBSYSTEM=="pci", KERNEL=="0000:00:14.0", ATTR{power/wakeup}="disabled"

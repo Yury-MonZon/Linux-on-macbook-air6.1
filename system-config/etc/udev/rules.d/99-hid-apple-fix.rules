@@ -1,0 +1,1 @@
+ACTION=="add", SUBSYSTEM=="module", KERNEL=="hid_apple", RUN+="/bin/sh -c 'echo 1 > /sys/module/hid_apple/parameters/swap_opt_cmd; echo 2 > /sys/module/hid_apple/parameters/fnmode; echo 1 > /sys/module/hid_apple/parameters/swap_fn_leftctrl'"

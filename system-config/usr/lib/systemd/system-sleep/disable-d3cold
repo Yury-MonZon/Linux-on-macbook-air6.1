@@ -1,0 +1,6 @@
+#!/bin/bash
+case $1 in
+  pre)
+    find /sys/devices/ -name d3cold_allowed -exec sh -c 'echo 0 > "$1" 2>/dev/null' _ {} \;
+    ;;
+esac

@@ -1,0 +1,10 @@
+[Unit]
+Description=Disable BD_PROCHOT (MSR_POWER_CTL bit 0) for no-battery/degraded-battery operation
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/no_batt_fix.sh
+
+[Install]
+WantedBy=multi-user.target

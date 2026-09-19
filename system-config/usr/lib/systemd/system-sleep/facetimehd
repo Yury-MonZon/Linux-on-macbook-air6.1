@@ -1,0 +1,25 @@
+#!/bin/bash
+# facetimehd's ISP firmware reload can stall for multiple seconds on
+# resume. The original bug this hook fixes (freeze at "hibernation
+# entry", item 23) only happens on a real on-disk hibernate write, so
+# only run the unload/reload for unambiguous hibernate-class verbs.
+#
+# IMPORTANT: do NOT match "suspend-then-hibernate" here. Confirmed live
+# (2026-09-14): with HandleLidSwitch=suspend-then-hibernate, systemd
+# passes $2=suspend-then-hibernate on EVERY lid-close, including a
+# plain few-second S3 wake that never actually reaches hibernation
+# (kernel log showed "PM: suspend entry (deep)" / "PM: suspend exit",
+# not hibernation, yet this hook still fired under the old match list).
+# A manual `systemctl hibernate` or an auto-escalated hibernate after
+# HibernateDelaySec elapses is expected to invoke this hook with the
+# literal $2=hibernate for that specific transition; NOT YET CONFIRMED
+# against a real elapsed-delay auto-escalation, only against a manual
+# hibernate test earlier this session and this suspend-only test.
+case "$2" in
+  hibernate|hybrid-sleep)
+    case "$1" in
+      pre)  modprobe -r facetimehd 2>/dev/null ;;
+      post) modprobe facetimehd 2>/dev/null ;;
+    esac
+    ;;
+esac

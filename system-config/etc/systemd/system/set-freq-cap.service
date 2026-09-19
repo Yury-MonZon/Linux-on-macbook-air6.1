@@ -1,0 +1,11 @@
+[Unit]
+Description=Cap CPU max frequency to 2.8GHz (measured optimal: eliminates thermal throttling, only bin below the 2.9-3.3GHz throttle cliff)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/set-freq-cap.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
