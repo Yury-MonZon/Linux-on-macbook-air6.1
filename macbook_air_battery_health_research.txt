@@ -1,0 +1,356 @@
+MacBook Air 6,1 — Battery Health / Design Capacity Investigation
+Research notes, 2026-09-13. Nothing in this document required any writes to
+the battery hardware itself — all reads shown below are the same kind of
+read-only queries the OS already performs, or standard read-only ACPI/kernel
+diagnostics. Kept separate from cachyos_patches_applied.txt (actually-applied
+system changes) and macbook_air_undervolt_research.txt (separate, unrelated
+CPU undervolt investigation).
+
+=====================================================================
+BACKGROUND / GOAL
+=====================================================================
+Noticed `upower`/GNOME reporting battery health ("capacity") at 84.5%, which
+seemed low/suspicious for the user's sense of how the battery has actually
+been performing. Investigated whether that number is trustworthy, and if
+not, what the real health is and why the reported figure is wrong.
+
+=====================================================================
+1. THE RAW NUMBERS
+=====================================================================
+From /sys/class/power_supply/BAT0/ and `upower -i .../battery_BAT0`:
+
+  energy_full          40,580,000 uWh  (40.58 Wh)  <- current real full-charge
+                                                        capacity, as tracked
+                                                        by the gas gauge chip
+  energy_full_design   48,000,000 uWh  (48.00 Wh)  <- OS-reported "design"
+                                                        capacity
+  cycle_count          0                            <- almost certainly not
+                                                        trustworthy (see below)
+  capacity (upower)    84.5%           = energy_full / energy_full_design
+  vendor               SMPNz451        <- TI gas-gauge IC identifier, NOT the
+  model_name           bq20z451           battery pack's own model/part number
+  serial_number        (empty)         <- see section 4, this is hardcoded
+                                           by Apple's firmware, not read from
+                                           the chip at all
+
+cycle_count=0 is implausible for a laptop in service since 2013 (13 years).
+Almost certainly Linux's generic ACPI battery path here isn't populating
+this field correctly (see section 3 — Apple's DSDT wrapper for _BIF/_BST
+does read some SBS fields but the standard kernel ACPI battery code may not
+be getting a real cycle count from this device at all). Not further chased
+in this investigation — flagged as a known gap.
+
+=====================================================================
+2. THE 48Wh DESIGN CAPACITY DOES NOT MATCH ANY KNOWN REAL BATTERY FOR
+   THIS MODEL
+=====================================================================
+Checked against every plausible real spec:
+  - Apple's genuine factory spec for the 11" 2013 MacBook Air
+    (MacBookAir6,1): 38.75 Wh
+  - Two aftermarket replacement battery variants the user found listed as
+    compatible with this exact model: 35 Wh and 39 Wh
+
+None of these are 48Wh. Recomputed "health" against each real candidate,
+using the actual measured energy_full (40.58 Wh):
+
+  40.58 / 48.00 (OS-reported, suspect)  = 84.5%
+  40.58 / 38.75 (Apple genuine spec)    = 104.7%
+  40.58 / 39.00 (compatible replacement)= 104.1%
+  40.58 / 35.00 (compatible replacement)= 115.9%
+
+CONCLUSION: against every plausible *real* battery spec for this machine,
+the current full-charge capacity is AT or ABOVE 100% of rated capacity —
+i.e. this battery is most likely near-full health. The only baseline that
+produces a "degraded" reading (84.5%) is the one baseline that doesn't
+correspond to any real battery this model shipped with or is known to
+accept as a compatible replacement. The 84.5% figure appears to be an
+artifact of a wrong reference value, not real wear.
+
+=====================================================================
+3. WHERE DOES THE WRONG 48Wh VALUE ACTUALLY COME FROM? (DSDT DECOMPILE)
+=====================================================================
+Hypothesis going in: maybe Apple's platform firmware (DSDT) just hardcodes
+"48Wh" as a fixed constant for this chassis, regardless of which battery is
+actually installed (which would mean the 48Wh figure is a firmware quirk,
+not evidence about the battery itself).
+
+Tested directly. Dumped the live ACPI tables from
+/sys/firmware/acpi/tables/ and decompiled with `iasl -d` (acpica package,
+already installed). All loaded tables checked for OEM ID first:
+
+  DSDT and SSDT1-6: OEM [APPLE], confirming genuine unmodified Apple
+                    firmware tables (SataAhci, SmcDppt, UsbLpt, SsdtS3,
+                    PcieTbt, Sdxc)
+  SSDT7-8:          OEM [PmRef] (Cpu0Ist, CpuPm) - standard Intel reference
+                    power-management tables Apple included
+  No custom/injected/overridden table anywhere. No acpi_override initrd
+  mechanism configured, no .aml files present, no mkinitcpio ACPI hooks,
+  no "ACPI table override" kernel log messages. Completely stock.
+
+Found Device(BAT0) in the decompiled DSDT (PNP0C0A - Control Method
+Battery). Traced the actual _BIF (Battery Information) method:
+
+  Method (_BIF, 0, NotSerialized)
+  {
+      If ((BSSW & 0x01)) { UBIF () }
+      Return (PBIF)
+  }
+
+  Method (UBIF, 0, NotSerialized)
+  {
+      \_SB.PCI0.LPCB.EC.SMB0.SBRW (0x0B, 0x18, RefOf (Local0))
+      PBIF [0x01] = (Local0 * 0x0A)      // DesignCapacity
+      \_SB.PCI0.LPCB.EC.SMB0.SBRW (0x0B, 0x10, RefOf (Local0))
+      PBIF [0x02] = (Local0 * 0x0A)      // LastFullChargeCapacity
+      \_SB.PCI0.LPCB.EC.SMB0.SBRW (0x0B, 0x19, RefOf (Local0))
+      PBIF [0x04] = Local0               // DesignVoltage
+      \_SB.PCI0.LPCB.EC.SMB0.SBRB (0x0B, 0x21, RefOf (Local0))
+      PBIF [0x09] = Local0               // "Model Number" (really DeviceName)
+      PBIF [0x0A] = Buffer (0x01) { 0x00 }   // Serial Number - HARDCODED BLANK
+      \_SB.PCI0.LPCB.EC.SMB0.SBRB (0x0B, 0x22, RefOf (Local0))
+      PBIF [0x0B] = Local0               // Battery Type (DeviceChemistry)
+      \_SB.PCI0.LPCB.EC.SMB0.SBRB (0x0B, 0x20, RefOf (Local0))
+      PBIF [0x0C] = Local0               // OEM Info (ManufacturerName)
+  }
+
+Traced SBRW/SBRB into Device(SMB0), _HID "ACPI0001" (SMBus 1.0 Host
+Controller). Confirmed these perform a REAL, LIVE SMBus transaction through
+the Embedded Controller every single call: set slave address (Arg0<<1),
+set command byte (Arg1), trigger the transaction, poll a completion flag
+(SBPC), then read back the actual data word/byte from EC-mapped registers
+(SBDW/SBFR) into the caller's variable.
+
+0x0B is the standard SBS smart-battery SMBus slave address. 0x18, 0x10,
+0x19, 0x20, 0x21, 0x22 are the literal standard Smart Battery Data
+Specification command codes for DesignCapacity, FullChargeCapacity,
+DesignVoltage, ManufacturerName, DeviceName, and DeviceChemistry
+respectively - not arbitrary/vendor-specific numbers.
+
+CONCLUSION (definitive, not a firmware constant): the "48Wh" figure is NOT
+hardcoded anywhere in Apple's platform firmware. It is read live, every
+time, directly from the physical battery pack's own gas-gauge chip via a
+real SMBus query using the standard DesignCapacity command. Apple's DSDT is
+functioning exactly as designed - faithfully relaying whatever the
+installed battery hardware itself claims as its own design capacity.
+
+This means the mismatch is located entirely in the battery pack's own
+gas-gauge chip data, not in the platform. Strong, concrete evidence this is
+a mismatched or non-genuine replacement battery whose gas-gauge chip was
+never correctly programmed/reprogrammed with the real cell's design
+capacity (a known failure mode for some aftermarket/counterfeit battery
+packs - the chip ships with a generic or leftover default DesignCapacity
+value that doesn't match the actual cells inside).
+
+Also settles a smaller side-question: the always-empty Serial Number field
+(PBIF[0x0A]) is hardcoded to a static empty buffer directly in UBIF -
+Apple's firmware never even attempts to read it from the chip. This is
+just how this platform always presents Serial Number regardless of which
+battery is installed; it says nothing about this specific pack.
+
+=====================================================================
+4. ATTEMPTED TO READ THE BATTERY'S REAL SERIAL NUMBER DIRECTLY (SBS
+   command 0x1C) - ALL LOW-EFFORT PATHS DEAD-ENDED, NOT PURSUED FURTHER
+=====================================================================
+Since UBIF never reads the real serial number (it's hardcoded blank), the
+actual value living in the chip's SerialNumber register (standard SBS
+command 0x1C) is never exposed anywhere in normal OS operation. Explored
+whether it could be read directly, one time, without any lasting system
+changes:
+
+  a) Kernel's live ACPI method-injection debug interface
+     (/sys/kernel/debug/acpi/custom_method) - NOT AVAILABLE. This kernel
+     was not built with CONFIG_ACPI_CUSTOM_METHOD. No live/no-reboot
+     option here.
+
+  b) acpi_call kernel module (available prebuilt, official cachyos-extra-v3
+     repo, NOT installed) - would let userspace invoke arbitrary ACPI
+     methods via /proc/acpi/call. BUT: SBRW's actual Return() value is only
+     a status code (0=success); the real data gets written into a SECOND
+     argument passed BY REFERENCE (RefOf(Local0)), a calling convention
+     that only works within the AML interpreter's own execution context.
+     acpi_call's simple call-and-get-return-value interface cannot capture
+     that byref output. Calling SBRW directly from userspace would only
+     ever yield "0" (success), never the actual serial number.
+
+  c) i2c-scmi (in-tree Linux driver, "ACPI SMBus CMI driver", built
+     specifically for ACPI SMBus-Control-Method-Interface devices like this
+     one's _HID "ACPI0001") - TRIED LIVE. Module loaded successfully
+     (modprobe exit 0) but bound to nothing: no new i2c adapter appeared,
+     no relevant dmesg output. This device's exact HID/CID combination
+     doesn't match what i2c-scmi's ID table (SMBUS01/SMBUSIBM/SMB0001)
+     recognizes on this kernel version. Unloaded again immediately
+     (rmmod), no lasting change made.
+
+  d) The only remaining path: write a small custom SSDT containing a
+     wrapper method that calls SBRW(0x0B, 0x1C, RefOf(Local0)) internally
+     and properly Return()s the value (reusing Apple's own already-tested
+     SBRW logic, just adding a return path UBIF doesn't provide for this
+     field), load it via the standard initrd ACPI-table-override mechanism,
+     then call the new wrapper via acpi_call. This DOES require a reboot to
+     apply (no live-injection available per (a)), and a second reboot to
+     cleanly remove the override afterward if not being kept permanently.
+
+DECISION: (d) is the only working path, but two reboots for one serial
+number is not worth it, especially since section 3 already gives strong,
+concrete, and sufficient evidence this is a mismatched/non-genuine battery
+without needing the serial number to confirm it further. Explicitly
+skipped by user request. Not pursued.
+
+=====================================================================
+5. CONSIDERED BUT NOT BUILT: SYSTEM-WIDE ACPI OVERRIDE TO FIX THE
+   REPORTED DESIGN CAPACITY EVERYWHERE (upower, GNOME, etc.)
+=====================================================================
+Since energy_full_design is a hard read-only sysfs attribute (confirmed:
+mode -r--r--r--, write attempt fails with Permission Denied even as root -
+the driver has no store/write path for it at all, this isn't a permissions
+issue), the only way to make standard tools show a corrected percentage
+system-wide would be an ACPI DSDT/SSDT override loaded via initramfs -
+the same standard, reversible, well-established Linux technique used for
+fixing other known-wrong platform ACPI values, never touching real
+firmware or the battery chip itself.
+
+This is now precisely scoped and low-risk if pursued later: patch just the
+one line in UBIF -
+    PBIF [0x01] = (Local0 * 0x0A)
+to instead assign a hardcoded correct constant (e.g. ~39000 mWh converted
+appropriately) - a purely informational/reporting change. DesignCapacity is
+never used by the gauge chip's own internal charging/protection logic (that
+logic lives entirely inside the chip's own firmware, completely unaffected
+by what ACPI reports to the OS), so this carries no functional or safety
+risk to actual charging behavior - it only affects displayed
+percentages/health calculations.
+
+NOT BUILT OR APPLIED in this investigation. Confirmed the system currently
+has zero existing ACPI overrides of any kind to build on or worry about
+conflicting with (see section 3 - completely stock). Available as a
+concrete next step if ever wanted; the exact target line is already
+identified, no need to re-decompile.
+
+=====================================================================
+6. MACOS-SIDE GROUND TRUTH (2026-09-13, done) - CYCLE COUNT + CONDITION
+=====================================================================
+User booted into macOS and pulled the real system_profiler-style battery
+report (saved as MacOS_BatteryInfo.rtf on the Backups drive). Real data,
+correctly decoded by Apple's own macOS driver stack (which reads fields
+Linux's generic ACPI path here does not, e.g. Cycle Count):
+
+  Manufacturer:              SMP        (Simplo Technology - a real,
+                                          well-known Apple-approved battery
+                                          supplier, not an obvious no-name
+                                          counterfeit brand)
+  Device Name:               bq20z451   (confirms this is the TI gas-gauge
+                                          chip's own identifier, as already
+                                          suspected - not a pack model number)
+  Pack Lot Code:              3230
+  PCB Lot Code:                3230
+  Firmware Version:           2d31
+  Hardware Revision:          322d
+  Cell Revision:               3036
+  Fully Charged:              No
+  Charging:                   Yes
+  Full Charge Capacity (mAh): 4058
+  State of Charge (%):        100
+  Cycle Count:                299        <- THE ANSWER: real, moderate,
+                                             ~23 cycles/year over 13 years
+                                             of service. Not a red flag.
+  Condition:                  Normal     <- Apple's own holistic health
+                                             verdict (not "Service Battery"
+                                             / "Replace Now")
+
+Cross-checked against Linux at the same real-world moment (immediately
+after this capture): energy_now = energy_full = 40,580,000 uWh (unchanged
+from the original reading), capacity: 100, status: Charging - i.e. both
+OSes agree on the live state simultaneously. energy_full did NOT shift/
+relearn from reaching 100% this cycle - stable, consistent value across
+sessions.
+
+IMPORTANT NEW WRINKLE, EXPLICITLY UNRESOLVED: macOS's "4058" and Linux's
+"40580000 uWh" are the same raw gas-gauge register value - Apple's own
+DSDT (UBIF, decompiled in section 3) applies a flat "x10" to produce the
+Linux/ACPI-facing figure. Whether that x10 is:
+  (a) a legitimate Smart Battery Spec unit conversion (SBS batteries running
+      in "power mode" report capacity directly in 10mWh units, which would
+      make Linux's 40.58Wh figure correct as-is), or
+  (b) a rough approximation standing in for this pack's real ~7.6V
+      (design_voltage per Linux) instead of a proper mAh-to-mWh conversion,
+      which would put the TRUE energy content closer to
+      4058mAh * 7.6V / 1000 ~= 30.8 Wh instead
+...could NOT be resolved without exactly the invasive chip-level access
+(BatteryMode register bit) already ruled out in section 4 as not worth two
+reboots. NOT further pursued. If (b) turned out to be true, the health
+percentage against the real ~38.75-39Wh spec would be ~79%, not the ~104%
+estimated in section 2 - genuinely unresolved either way.
+
+=====================================================================
+7. RESOLVED DEFINITIVELY (2026-09-13): RAW IOKit DUMP, section 6's
+   ambiguity settled, EARLIER "~104%, probably fine" THEORY WAS WRONG
+=====================================================================
+User ran the commands from section 6 on the macOS side (ioreg -l -w0 -r -c
+AppleSmartBattery[Manager], system_profiler SPPowerDataType -json,
+pmset -g batt) and brought the output back. This settles section 6's open
+question definitively:
+
+  DesignCapacity (native IOKit unit, unambiguous)  = 4800 mAh
+  MaxCapacity / AppleRawMaxCapacity (current full)  = 4058 mAh
+  CurrentCapacity / AppleRawCurrentCapacity          = 4058 mAh
+  CycleCount                                          = 299
+  DesignCycleCount9C (rated cycle life)               = 1000
+  Serial                                              = C01514309YEF90MA4
+  Manufacturer                                        = SMP
+  DeviceName                                          = bq20z451
+  Voltage (live, under charge)                        = 8385 mV
+  CellVoltage                                         = (4186, 4199) mV - 2S pack
+  sppower_battery_health (system_profiler JSON)       = "Good"
+
+IOKit's DesignCapacity/MaxCapacity/CurrentCapacity keys are always in mAh -
+a standard, well-documented, completely unambiguous unit. No voltage
+conversion needed, no interpretation required.
+
+REAL HEALTH = 4058 / 4800 = 84.5% - EXACTLY matching the original
+upower/Linux-reported figure from section 1.
+
+CORRECTION TO SECTION 2's CONCLUSION: the earlier theory ("48Wh doesn't
+match any real spec for this model, so it's probably wrong/mismatched, and
+real health is likely ~104-116%") was WRONG. What actually happened: Apple's
+DSDT (UBIF, section 3) applies its "x10" scaling to BOTH DesignCapacity
+(4800 -> 48000, shown by Linux as "48Wh") AND MaxCapacity (4058 -> 40580,
+shown as "40.58Wh") equally - so the RATIO between them survived intact
+(4058/4800 = 40580000/48000000 = 84.5%) even though neither individual
+number is a real watt-hour energy figure. The mistake was assuming 48
+"Wh" had to be wrong because it didn't match any battery spec found via
+general web research (Apple's genuine 38.75Wh 11" spec, or the 35Wh/39Wh
+compatible replacements found for sale) - but 4800 mAh is simply this
+EXACT pack's own real, Apple-confirmed design capacity. It was never
+supposed to match those unrelated Wh figures in the first place; comparing
+a native mAh spec against unrelated Wh specs found online was the actual
+error, not the original 84.5% reading.
+
+This also fully explains the earlier-flagged inconsistency between section
+2 (looked healthy) and section 6 (macOS said "Condition: Normal"/"Good"):
+there never was an inconsistency. 84.5% capacity retention at 299 of a
+1000-cycle rated life (~30% of rated cycle life used) is exactly the kind
+of moderate, unremarkable aging Apple's own health algorithm considers
+"Good"/"Normal" - not a contradiction, a consistent picture once the real
+numbers are in.
+
+The real serial number (C01514309YEF90MA4) matches genuine Apple battery
+serial number formatting, further supporting this is a legitimately
+manufactured SMP/Simplo pack (consistent with section 6's manufacturer
+finding) that has simply undergone normal, moderate real-world aging - not
+a counterfeit, not a mismatched replacement, just ~15% degraded after 13
+years and 299 cycles.
+
+=====================================================================
+8. FINAL SUMMARY / DEFINITIVE ANSWER
+=====================================================================
+Q: Is this battery actually degraded to 84.5% health?
+A: YES, genuinely, confirmed via Apple's own authoritative IOKit data in
+   native mAh units (4058/4800 = 84.5%), with no unit ambiguity remaining.
+   This is a real, moderate, expected level of wear for a genuine
+   SMP/Simplo-manufactured pack after 299 of a rated 1000 charge cycles
+   over ~13 years - not evidence of counterfeiting or a mismatched
+   replacement, and not something to be alarmed about, but also not the
+   "probably near-full-health" conclusion earlier sections of this document
+   mistakenly reached. Trust this section (8) over section 2 and section
+   6's "unresolved" framing - both are superseded by this direct,
+   unambiguous, native-unit measurement.

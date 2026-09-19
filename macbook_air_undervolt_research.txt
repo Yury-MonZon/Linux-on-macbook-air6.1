@@ -1,0 +1,292 @@
+MacBook Air 6,1 (i7-4650U) — Undervolting & Package C-State Investigation
+Research notes, 2026-09-11. NOTHING in this document was applied to the running
+system — every test below was reverted. NO FLASH was ever performed to the SPI
+chip. This is research/findings only, kept separate from cachyos_patches_applied.txt
+(which tracks actually-applied, currently-active changes).
+
+=====================================================================
+BACKGROUND / GOAL
+=====================================================================
+Started from digging into why CPU package C-states never go past C3 (see
+cachyos_patches_applied.txt for that side of the investigation — also
+unresolved, concluded to be a board-level hardware limitation). That led to
+trying CPU undervolting for a possible power/thermal win, which then led to
+discovering Apple's Haswell-era firmware locks the undervolt mailbox, and
+from there into a full firmware-analysis side-quest.
+
+=====================================================================
+1. UNDERVOLTING VIA intel-undervolt — BLOCKED (OC_LOCK)
+=====================================================================
+Installed `intel-undervolt` (official repo, 1.7-3). Config lives at
+/etc/intel-undervolt.conf, 5 voltage planes: CPU, GPU, CPU Cache, System
+Agent, Analog I/O.
+
+Set CPU + CPU Cache to -50mV, ran `intel-undervolt apply`:
+  CPU (0): Values do not equal
+  CPU Cache (2): Values do not equal
+`intel-undervolt read` afterward: all planes stuck at -0.00 mV regardless.
+Write is accepted with no error, but silently discarded by hardware.
+
+Checked /sys/module/msr/parameters/allow_writes: was "default" — this is the
+kernel's Plundervolt mitigation (CVE-2019-11157) gate on MSR 0x150 writes.
+Set to "on" live via sysfs. Retried apply/read — IDENTICAL failure. Reverted
+allow_writes back to "default" afterward (no benefit, no reason to leave a
+mitigation loosened).
+
+Note: this CPU (i7-4650U) has ZERO SGX support (`grep -c sgx /proc/cpuinfo`
+= 0), so the actual threat Plundervolt's kernel mitigation defends against
+doesn't even apply here — moot regardless of the allow_writes state.
+
+Raw MSR 0x150 test: read before (0x40000000000), wrote an arbitrary test
+pattern (0x8000001100000000), readback changed but did NOT match what was
+written (0x100000000). Restore-write attempt afterward did not change the
+readback either. Conclusion: MSR 0x150 on this platform behaves as a
+request/response "mailbox" (write a command word, hardware validates and
+either commits or silently ignores it), not a plain register — arbitrary
+raw writes are safely ignored by the hardware's own protocol validation if
+malformed, which is what almost certainly happened with the manual test
+write (no evidence the CPU's actual voltage state was ever affected by it).
+STOPPED hand-crafting raw MSR values after this — too easy to get the
+encoding wrong on a live system.
+
+Web research confirmed: MacBooks show a "OC_Locked" message in tools like
+VoltageShift when this mailbox is locked. Per community docs (IsmaelHG's
+UndervoltPatchMacBook project): Haswell-based MacBooks (2013-2014) are
+LOCKED and require a firmware patch to unlock. Broadwell (2015) Macs ship
+already unlocked. This MacBook Air 6,1 is exactly the locked generation.
+
+=====================================================================
+2. dis_ucode_ldr TEST — RULED OUT, CONFIRMED NOT THE CAUSE
+=====================================================================
+Hypothesis: maybe a microcode update added/hardened the lock. Tested by
+adding `dis_ucode_ldr` to KERNEL_CMDLINE (disables Linux's own microcode
+loader), full reboot, retried the undervolt write.
+
+Result: microcode revision UNCHANGED (0x26 before and after) — proving
+Linux was never applying its own microcode update in the first place; the
+active revision is 100% supplied by Apple's EFI firmware during its own
+PEI-phase boot, before dis_ucode_ldr's effect window even begins. Retried
+the undervolt write anyway: IDENTICAL failure signature. Reverted
+dis_ucode_ldr from cmdline, rebuilt, rebooted back to clean state.
+
+Separately: Intel's actual microcode-level Plundervolt mitigation only ever
+shipped for SGX-capable CPUs (Skylake+) — another reason this was never
+going to be the real cause on this SGX-less Haswell part.
+
+=====================================================================
+3. FIRMWARE DUMP + ANALYSIS
+=====================================================================
+Chip: Micron/Numonyx/ST N25Q064..3E, 8192 kB (8MB), SPI, at PCI
+0000:00:1f.0 "intel-spi" -> spi0.0, driver "spi-nor".
+
+Two dumps taken (see archived .bin files):
+  macbook_backup.bin       - via /dev/mtd0 (Linux MTD/"Opaque" path), safe,
+                              no driver unbind needed. 8,388,608 bytes.
+  macbook_full_dump.bin    - via `flashrom -p internal -r`, DIRECT hardware
+                              access. Required:
+                                1. unbind spi-nor from spi0.0 first
+                                   (echo spi0.0 > .../spi-nor/unbind)
+                                2. add `iomem=relaxed` to KERNEL_CMDLINE +
+                                   reboot (kernel's strict /dev/mem
+                                   protection otherwise blocks flashrom's
+                                   RCRB access at 0xfed1c000 with
+                                   "Operation not permitted")
+                                3. flashrom -p internal -r <file>
+                              Rebound spi-nor and reverted iomem=relaxed
+                              (rebooted back to clean cmdline) immediately
+                              after the dump.
+  Both dumps compared: 674 bytes differ out of 8,388,608, all clustered at
+  offset 0x6234a5 onward — which is exactly the one small sliver of flash
+  that's actually write-UNPROTECTED (see below). A reboot happened between
+  the two reads. Conclusion: normal firmware NVRAM variable churn (boot
+  counter/timestamp-type data), not a bad/inconsistent read. Both dumps are
+  trustworthy.
+
+Flash region layout (from flashrom's direct-access read):
+  FREG0 Flash Descriptor   0x000000-0x000FFF   read-only
+  FREG4 Platform Data      0x001000-0x001FFF   read-only
+  FREG2 Management Engine  0x002000-0x18DFFF   read-only (~1.5MB, unrelated)
+  FREG1 BIOS region        0x18E000-0x7FFFFF   nominally read-write, BUT:
+    PR0  0x000000-0x001FFF  read-only (overlaps descriptor/platform data)
+    PR1  0x18E000-0x60FFFF  read-only  <-- covers almost all of BIOS region
+    PR2  0x632000-0x1FFFFFF read-only  <-- covers the rest (range exceeds
+                                            actual chip size, likely a
+                                            catch-all/placeholder encoding)
+  Net result: only ~0x610000-0x631FFF (~140KB) of the entire 8MB chip is
+  actually write-unprotected at the hardware level. Everything else is
+  locked by Protected Range registers enforced in silicon, independent of
+  OS/software permissions. "SPI Configuration is locked down" (FLOCKDN bit)
+  was also reported — normal/expected on every modern Intel platform, not
+  Apple-specific; it just means these PR registers can't be reprogrammed at
+  runtime, and get re-locked fresh by firmware at every single boot.
+
+Ran `uefiextract` on macbook_full_dump.bin: 6067 files extracted (some
+"unknown file system"/"unknown FFS version" warnings for a couple of
+sub-regions, but the bulk parsed fine, including the full BIOS region).
+Report saved as macbook_full_dump.bin.report.txt.
+
+Confirmed embedded microcode via UEFITool's FIT parser:
+  CpuSignature 00040650h, Revision FFFF000Bh (stub/placeholder slot)
+  CpuSignature 00040651h, Revision 00000026h, Date 12.11.2019
+    <- matches the live `microcode: 0x26` exactly.
+
+Ran `ifrextractor` (Rust tool) against every extracted body.bin (1593
+files): only ONE file contained any IFR data at all, and even that one
+only printed a boilerplate "Extracting all Framework HII form packages..."
+line with no actual decoded form/setting data (this firmware uses the
+older "Framework HII" spec rather than full UEFI 2.x HII; the tool's
+support for that legacy format is evidently incomplete).
+
+Searched every extracted file (ASCII + UTF-16LE) for: PROCHOT, Overclock,
+Undervolt, "OC Lock", "CFG Lock" -> ZERO hits anywhere in the entire
+decompressed firmware. This is a real, meaningful negative result: the
+undervolt lock is almost certainly NOT a named, user-facing Setup-menu
+toggle backed by an NVRAM byte (if it were, there would be a label string
+for it somewhere in the HII string packages). It is far more likely
+hardcoded directly into compiled PEI/DXE driver logic that runs
+unconditionally at every boot — exactly like the already-documented
+CFG_LOCK precedent for this same firmware generation (Apple's Haswell EFI
+source contains a literal `PmgCstConfCntr |= BIT15; //Lock CFG` — found via
+web research, pikeralpha.wordpress.com, "Haswell Power Management Fix").
+
+NOTE: this machine DOES have a genuine AMI/Insyde-style `Setup` NVRAM
+variable (confirmed live via /sys/firmware/efi/efivars/Setup-4dfbbaab-...,
+692 bytes, real per-setting-byte structure, not a stub) plus a
+`SetupDefaults-...` variable. This means the generic `setup_var`/
+modGRUBShell/OpenCore-Tools technique COULD in principle work on this
+hardware architecture for OTHER settings that genuinely live in that
+blob — but the string-search result above says undervolt/OC_LOCK is very
+unlikely to be one of them.
+
+=====================================================================
+4. UndervoltPatchMacBook (github.com/IsmaelHG/UndervoltPatchMacBook) —
+   TESTED AGAINST OUR DUMP, MATCHES CLEANLY, BUT NEVER FLASHED
+=====================================================================
+Their patches.txt targets:
+  FileGuid F7731B4C-58A2-4DF4-8980-5645D39ECE58 ("PowerMgmtDxe | Haswell")
+  Section type: PE32 image (10)
+  Pattern:  0D00001000F6  ->  0FBAF01490F6
+  (x86: `OR EAX, 0x00100000` [set bit 20] -> `BTR EAX, 0x14` + NOP padding
+  [clear bit 20], same instruction length preserved)
+
+Ran `uefipatch macbook_full_dump.bin patches.txt -o
+macbook_full_dump_TESTPATCH.bin`:
+  "patch: replaced 6 bytes at offset 4DE2h 0D00001000F6 -> 0FBAF01490F6"
+  "Image patched"
+
+This means the EXACT byte pattern from a MacBook Pro 15" (2013/2014)
+firmware patch was found, unmodified, in this MacBook Air 6,1's firmware —
+strong evidence `PowerMgmtDxe` is unmodified Intel Haswell reference code
+shared across the whole Haswell Mac lineup, not something Apple recompiled
+per chassis.
+
+Verified the patch was clean and isolated: raw-file cmp showed ~786K bytes
+differing between original and patched dump, BUT that's expected
+recompression noise (the target instruction lives inside an LZMA-compressed
+firmware volume, so patching+recompressing that volume changes many
+downstream compressed bytes even for a tiny logical edit). Extracted BOTH
+files with uefiextract and diffed the actual DECOMPRESSED PowerMgmtDxe
+module directly: exactly 5 bytes differ (byte 6 of the pattern, 0xF6, is
+identical in both original and replacement so correctly shows no diff),
+at decimal offset 19939 = 0x4DE3 (matching the reported 0x4DE2 zero-indexed
+offset exactly). Nothing else in that entire module changed. This is a
+precise, verified, non-coincidental match — not a fluke.
+
+=====================================================================
+5. WHY WE DECIDED NOT TO FLASH (explicit user decision: "WE DO NOT FLASH")
+=====================================================================
+- No external SPI programmer/clip available (CH341A + SOIC8, or similar) —
+  the only reflash method the source project documents at all.
+- Internal `flashrom -p internal -w` is NOT a viable substitute:
+    - The patch target (inside PowerMgmtDxe, early in the BIOS region) is
+      almost certainly within PR1's hardware-locked range (0x18E000-
+      0x60FFFF) — enforced in silicon by the SPI controller itself,
+      independent of OS/software permissions. FLOCKDN means this can't be
+      reprogrammed at runtime either.
+    - flashrom itself flagged this exact chipset ("Intel Lynx Point LP
+      Premium") as "marked as untested" — write behavior isn't validated
+      by flashrom's own developers on this chipset, only read.
+    - Self-hosted internal reflashing is structurally riskier than external
+      programming regardless: if anything interrupts the write (crash,
+      power loss, unexpected reset), there's no working system left to
+      retry from, since the same chip/CPU doing the writing is also what
+      the system needs to boot afterward.
+- Zero confirmed precedent for this EXACT patch on a MacBook Air of any
+  generation — every tested/verified case in the source project is a
+  MacBook Pro 15" (2013/2014), a different chassis/board/CPU (quad-core
+  H-series vs this machine's dual-core ULT i7-4650U). Byte-pattern match on
+  a shared reference driver is a good sign, not proof of full-system
+  compatibility (no control-flow/disassembly analysis was done to confirm
+  the surrounding code path is reached identically on this board).
+- No known secondary/failover BIOS copy on this hardware — a bad write is
+  not obviously recoverable without external hardware anyway.
+- Modest expected upside (some thermal/power headroom on an already
+  low-power ULT chip) against a severe, hard-to-reverse downside (bricked
+  daily-driver laptop) if anything goes wrong.
+
+DECISION: research complete, conclusive. Undervolting is not achievable on
+this hardware without a firmware flash, and a firmware flash is not being
+pursued — no external programmer, and internal flashrom write is blocked
+at the hardware level for the region that matters anyway. All test changes
+made during this investigation (MSR writes, allow_writes, dis_ucode_ldr,
+iomem=relaxed, spi-nor unbind) were reverted; the live system was returned
+to its clean baseline after every test.
+
+=====================================================================
+7. FOLLOW-UP (2026-09-13): S3 RESUME DOES NOT CLEAR THE LOCK — TESTED
+=====================================================================
+Revisited during an unrelated sleep/hibernate stability investigation (see
+the sleep-related memory notes from that session). Question raised: since
+real ACPI S3 resume replays a small recorded "boot script" rather than
+re-running full DXE dispatch, maybe PowerMgmtDxe's lock-setting mailbox
+command isn't part of that replayed script, and the lock would come back
+cleared after a genuine S3 sleep (as opposed to s2idle, which never
+power-cycles the SoC at all). This was a hypothesis, not something found
+documented anywhere (searched specifically; found nothing on this exact
+"OC_Locked"/FIVR-mailbox lock surviving or clearing across S3 for Macs —
+only found generic-PC "CFG Lock" MSR 0xE2 runtime patchers like CFGLock.efi/
+Ru.efi, which explicitly do NOT apply to real Macs, which don't use that
+mechanism at all — confirmed independently: this machine's own MSR 0xE2
+bit 15 already reads 0/unlocked, consistent with that).
+
+TESTED LIVE, ZERO FLASH RISK: forced /sys/power/mem_sleep to `deep`, set a
+small -20mV test offset on CPU + CPU Cache planes, confirmed baseline
+failure ("Values do not equal", reads -0.00mV), did a real
+`rtcwake -m mem -s 30` (confirmed via `PM: suspend entry (deep)` /
+`PM: suspend exit` in the kernel log — genuine S3, not s2idle), then
+immediately retried apply/read on resume.
+
+RESULT: IDENTICAL FAILURE. "Values do not equal" before and after, -0.00mV
+both times. The lock is NOT reset by a real S3 sleep/resume cycle — it's
+either re-armed as part of the actual S3 resume boot script after all, or
+it's held in some more persistent state (PCU/ME) that S3 doesn't clear.
+Reverted /sys/power/mem_sleep to s2idle and the test offsets back to 0
+immediately after, per usual practice in this file.
+
+This closes off the "maybe sleep/resume clears it" idea conclusively — it
+was tested directly, not just reasoned about. Combined with section 5's
+conclusion, there is no known way to achieve undervolting on this specific
+machine without an external-programmer SPI flash of the verified
+PowerMgmtDxe patch from section 4. Nothing else (different bootloader,
+generic CFG-Lock runtime patchers, PEI/Option-ROM injection, S3 resume)
+has panned out after extensive investigation across two separate sessions.
+
+=====================================================================
+6. ARCHIVED FILES (see macbook_undervolt_research_dumps.tar.gz alongside
+   this file)
+=====================================================================
+  macbook_backup.bin              - firmware dump, MTD/safe path
+  macbook_full_dump.bin           - firmware dump, direct hardware path
+                                     (the more authoritative of the two,
+                                     but both verified consistent)
+  macbook_full_dump_TESTPATCH.bin - patched TEST OUTPUT ONLY, NEVER FLASHED
+                                     to the actual chip. Kept purely as
+                                     proof/reference of what a real patch
+                                     attempt would look like.
+  macbook_full_dump.bin.report.txt- UEFITool structural report of the
+                                     unpatched dump
+  macbook_full_dump.log           - uefiextract run log
+  ifr_results/all_ifr.txt         - the one (inconclusive) IFR extraction
+                                     hit
+  UndervoltPatchMacBook-main/     - the source project (README, patches.txt,
+                                     images), downloaded for reference
