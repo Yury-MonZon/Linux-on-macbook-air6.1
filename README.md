@@ -678,3 +678,18 @@ Do §16 first if you also want the battery-info fields this section doesn't cove
 **Charging status near 100%:** this pack's firmware doesn't always flip its own completion bits promptly, and can keep delivering a real, slowly-tapering top-balance trickle current for many minutes after `charge_now` already equals `charge_full`. The module reports `Full` as soon as the charge registers themselves say 100%, rather than waiting on the EC's own (sometimes late) completion signal, so `upower`/`status` won't sit on `Charging` for the whole trickle tail.
 
 ---
+
+## 18. Post-kernel-update maintenance
+
+Two scripts, both in [`system-config/usr/local/bin/`](system-config/usr/local/bin/). Neither runs `pacman -Syu` itself; both assume you've already updated the system yourself and are checking/repairing after the fact.
+
+```bash
+sudo install -m 755 system-config/usr/local/bin/post-kernel-update-check.sh /usr/local/bin/
+sudo install -m 755 system-config/usr/local/bin/build-resume-lab-kernel.sh /usr/local/bin/
+```
+
+**`post-kernel-update-check.sh`** — run after any kernel package update. Pacman's own DKMS hooks already rebuild `acpi_call`/`broadcom-wl`/`facetimehd`/`macbat-fix` automatically and `limine-update` already regenerates the initramfs/boot menu; this doesn't replace either, it verifies they actually worked and repairs the one failure mode neither hook would ever notice: `facetimehd`'s out-of-tree source needing the strncpy→strscpy fix (§7) reapplied, which happens again any time the AUR package ships a clean unpatched source. Also re-checks the ACPI overrides (§10a, §17) are present in every kernel's actual boot-time initramfs (not the flat `/boot/initramfs-*.img` copies, which `limine.conf` doesn't reference), the `no_batt_fix`/`set-freq-cap` units, the CPU frequency cap, and the udev rules — auto-fixing anything drifted, printing `FAIL` for anything it can't safely fix on its own. Exit code is 0 only if everything is OK or was fixed.
+
+**`build-resume-lab-kernel.sh`** — run after a `pacman -Syu` that pulled in a newer upstream `linux-cachyos`, to get a `linux-cachyos-deferred` build (see [`kernel-patches/resume-lab/`](kernel-patches/resume-lab/)) matching that new version. Pulls the current upstream PKGBUILD and the current resume-lab patch (from this repo, always the latest published one), applies the same three-line customization used throughout this project (`_processor_opt=generic_v3`, the `-deferred` package suffix, wiring in the patch), and builds. **Safety contract:** if the patch doesn't apply cleanly against whatever upstream changed, or the build succeeds but a post-build grep for the patch's own marker code (`pm_resume_cpu_online_pending` in `kernel/cpu.c`) doesn't find it, the script aborts and installs nothing — the currently-running kernel is never replaced with an unpatched or partially-patched one. A patch conflict needs a human to resolve it (adapt `0011-resume-lab-v5.patch` to whatever upstream changed, test, then re-run); this script will not guess.
+
+---
